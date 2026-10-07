@@ -30,6 +30,9 @@ mingw32-make flash            # 编译 + 烧录
 
 > 需要 PATH 里有 **GNU Make**（本机是 `C:\MinGW\bin\mingw32-make.exe`，`build.cmd` 会先检查并给出提示）。
 > `flash.ps1` 是 PowerShell 脚本，必须保存为 **UTF-8 带 BOM**，否则 Windows PowerShell 5.1 会按 GBK 解码中文注释、直接语法报错（本工程已带 BOM）。
+>
+> **刚用 CubeMX 重新生成过代码？** 也直接跑 `build.cmd` 就行 —— 它编译前会先执行 `cubemx-fix.ps1`，
+> 自动补回被 CubeMX 覆盖的两处内容（无变更时静默跳过）。详见 §3.3。
 
 跑起来之前**必须先改** [library/esp_net_config.h](../../library/esp_net_config.h) 里的 WiFi 与 MQTT 服务器地址，否则会一直打印 `wifi join failed`。
 
@@ -51,8 +54,9 @@ examples/stm32f103c8t6/
 ├─ STM32F103XX_FLASH.ld          链接脚本
 ├─ stm32103.ioc                  CubeMX 工程文件（改引脚/外设就改它再重新生成）
 ├─ Makefile                      ★ 构建主体（CubeMX「Makefile」工具链的形状，可被重新生成）
-├─ Makefile.user                 ★ 我们自加的源文件/包含路径（CubeMX 不认识，重新生成不会被覆盖）
-├─ build.cmd                     ★ 双击即可编译（内部调 mingw32-make）
+├─ Makefile.user                 ★ 我们自加的源文件/包含路径 + 头文件依赖（CubeMX 不认识，重新生成不会被覆盖）
+├─ cubemx-fix.ps1                ★ CubeMX 重新生成后的自动修补（build.cmd 会调）
+├─ build.cmd                     ★ 双击即可编译（内部先调 cubemx-fix.ps1，再调 mingw32-make）
 ├─ flash.ps1  flash.cmd          ★ ST-Link 烧录脚本
 └─ build/                        输出目录（build\Debug、build\Release，已 gitignore）
 ```
@@ -144,6 +148,10 @@ Release : FLASH 25892 B / 64 KB (39.51%)   RAM 14720 B / 20 KB (71.88%)
 > **新增自己的 .c 文件时，写到 `Makefile.user`，不要写进 `Makefile`。**
 > 理由：`Makefile` 是 CubeMX 能重新生成的文件（见 §3.3），写进去会被覆盖；`Makefile.user` 不会被碰。
 > 忘了加会导致链接报 `undefined reference`。
+>
+> **改 `.h` 也会触发重编。** `Makefile.user` 末尾用 `-MMD -MP` + `-include $(wildcard $(BUILD_DIR)/*.d)`
+> 打开了头文件依赖跟踪，所以改 `library/esp_net_config.h`（最常改的 WiFi/服务器配置）会正确重编，不会
+> 出现「改了没生效」的静默错误。末尾那三行**不要删**（原因见仓库根目录 `AGENTS.md` §3 #11）。
 
 ### 3.2 方式二：手动敲命令（了解原理 / 没有 make 的环境）
 
@@ -232,25 +240,41 @@ New-Item -ItemType Directory -Force build\Debug | Out-Null
 & 'D:\twBlock\toolchains\gcc-arm\bin\arm-none-eabi-size.exe' build/Debug/stm32103.elf
 ```
 
-### 3.3 用 CubeMX 重新生成代码时要注意什么
+### 3.3 用 CubeMX 重新生成代码后怎么编译
 
 工程的 `.ioc` 已把工具链设为 **Makefile**（`ProjectManager.TargetToolchain=Makefile`），
 所以以后用 CubeMX 重新生成时，它会产出一份**属于它的 `Makefile`，并覆盖本目录现有的 `Makefile`**。
 
-好在我们已经把「CubeMX 管的部分」和「我们管的部分」分开了：
+**结论：不用记任何东西，生成完直接跑 `build.cmd`。** 它在编译前会先执行 `cubemx-fix.ps1`，
+把 CubeMX 覆盖掉的两处内容自动补回（没变更时静默跳过）：
+
+| 被覆盖的文件 | 要补回的内容 | 补在哪 |
+|---|---|---|
+| `Makefile` | 一行 `-include Makefile.user` | 插在 `vpath %.c` 之前 |
+| `STM32F103XX_FLASH.ld` | 删掉 5 处 `(READONLY)` 段属性（见 §3.4 ②） | 就地删除 |
+
+分工一览：
 
 | 谁管 | 文件 | 重新生成后 |
 |---|---|---|
-| CubeMX | `Makefile`（主体：Core / Drivers / Middlewares 的源清单与包含路径） | 被覆盖 |
-| 我们 | `Makefile.user`（`../../library`、`../../port`、`demo_app.c`） | **不受影响** |
+| CubeMX | `Makefile`（主体：Core / Drivers / Middlewares 的源清单与包含路径） | 被覆盖，由 `cubemx-fix.ps1` 修补 |
+| CubeMX | `STM32F103XX_FLASH.ld`（链接脚本） | 被覆盖，由 `cubemx-fix.ps1` 修补 |
+| 我们 | `Makefile.user`（`../../library`、`../../port`、`demo_app.c` + 头文件依赖） | **不受影响** |
+| 我们 | `cubemx-fix.ps1`（自动修补脚本） | **不受影响** |
 
-所以重新生成后只需要做一件事：**把这一行补回主 `Makefile`**（位置：紧跟 `C_INCLUDES` 定义之后），然后照常 `mingw32-make`：
+若你**绕过** `build.cmd`、直接敲 `mingw32-make`，请先手动跑一次修补脚本：
 
-```makefile
--include Makefile.user
+```powershell
+powershell -NoProfile -ExecutionPolicy Bypass -File .\cubemx-fix.ps1
+mingw32-make
 ```
 
-另见 §3.4。
+> `cubemx-fix.ps1` 靠锚点行 `vpath %.c` 定位插入点。万一 CubeMX 模板变了导致锚点找不到，
+> 脚本会**直接报错中止**（而不是静默编出坏产物），届时按报错提示改脚本里的锚点即可。
+
+**退化项**（CubeMX 生成后不影响能不能编过，只是没那么顺手）：产物落到扁平的 `build\` 而非
+`build\Debug`/`build\Release`；`clean` 用 CubeMX 原生的 `-rm -fR`（本机 MinGW 没有 `rm`，会打印一条
+错误但不中断编译）。`flash.ps1` 两种目录都能找到固件，所以烧录不受影响。
 
 ### 3.4 为适配 GCC 5.2.1（很老）需要注意的两处
 
@@ -281,8 +305,9 @@ STM32F103XX_FLASH.ld:105: non constant or forward reference address expression f
 
 链接脚本自己的注释也写了「GCC10 或更早就删掉它」。删掉后对 GCC 11+ 同样合法，所以这个改动是安全的。
 
-> ⚠️ 如果以后用 CubeMX 重新生成代码，`STM32F103XX_FLASH.ld` 与 `Makefile` 都会被覆盖：
-> 前者要把 `(READONLY)` 再删一遍（见 ② ），后者要把 §3.3 那一行 `-include Makefile.user` 补回。
+> ⚠️ 如果以后用 CubeMX 重新生成代码，`STM32F103XX_FLASH.ld` 与 `Makefile` 都会被覆盖 ——
+> 但**不用手工补**：跑 `build.cmd` 即可，它会先执行 `cubemx-fix.ps1` 把 §3.3 表里的两处自动补回
+> （`(READONLY)` 按 ② 删掉、`-include Makefile.user` 插回）。详见 §3.3。
 
 ---
 

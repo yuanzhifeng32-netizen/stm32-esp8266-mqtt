@@ -63,8 +63,13 @@ try {
         exit $LASTEXITCODE
     }
 
-    $Target = if ($File) { $File } else { "build/$Config/stm32103.elf" }
-    if (-not (Test-Path $Target)) { throw "找不到固件 $Target，请先运行 mingw32-make 编译。" }
+    # 产物路径：本仓库的 Makefile 输出到 build\<配置>\；CubeMX 原生 Makefile 输出到
+    # build\（用 CubeMX 重新生成覆盖 Makefile 后会退化成扁平目录），两种都找一遍
+    $candidates = if ($File) { @($File) } else { @("build/$Config/stm32103.elf", "build/stm32103.elf") }
+    $Target = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+    if (-not $Target) {
+        throw "找不到固件（找过：$($candidates -join ' 、 ')）。请先运行 build.cmd 或 mingw32-make 编译。"
+    }
     # OpenOCD 对含中文的绝对路径不友好，统一转成相对路径（脚本已切到工程根目录）
     $Target = (Resolve-Path $Target).Path.Substring($Root.Length).TrimStart('\', '/') -replace '\\', '/'
 
