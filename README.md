@@ -17,6 +17,9 @@
 
 ```
 .
+├─ README.md                    ← 你正在看的：框架介绍 + 快速开始 + API 表
+├─ AGENTS.md                    ← 维护指南（架构不变量 / 验证步骤 / 禁止事项），改代码前先读
+├─ LICENSE                      MIT
 ├─ library/                     ← 框架本体（平台无关，可直接拷进任何工程）
 │   ├─ esp_net.h                ★ 用户唯一需要 include 的头文件（7 个 API）
 │   ├─ esp_net.c                联网编排：连 WiFi→TCP→MQTT、断线自愈、命令分发
@@ -29,10 +32,10 @@
 │   └─ esp_port_stm32f1.c/.h    STM32F1 + HAL + FreeRTOS：USART DMA 循环 + IDLE 中断
 │
 └─ examples/
-    └─ stm32f103c8t6/           ← 完整可跑 demo（CubeMX 工程 + 一键编译/烧录脚本 + 说明.md）
+    └─ stm32f103c8t6/           ← 完整可跑 demo（CubeMX 工程 + 一键编译/烧录脚本）
+        ├─ README.md            ★ 本 demo 的编译烧录说明 / ST-Link 排错 FAQ
         ├─ Core/Src/demo_app.c  ★ 业务示例：周期上报 + 下行命令（先看这个）
-        ├─ build.cmd / flash.cmd
-        └─ 说明.md              编译烧录细节 / 排错 FAQ
+        └─ build.cmd / flash.cmd
 ```
 
 分层边界（照这个读代码就不会乱）：
@@ -187,7 +190,7 @@ A：库和 demo **全程零 `malloc`**，所有缓冲都是静态分配（大小
 
 ## Demo：STM32F103C8T6 一键跑起来
 
-见 [examples/stm32f103c8t6/说明.md](examples/stm32f103c8t6/说明.md)。最快路径：
+见 [examples/stm32f103c8t6/README.md](examples/stm32f103c8t6/README.md)。最快路径：
 
 ```bat
 cd examples\stm32f103c8t6
