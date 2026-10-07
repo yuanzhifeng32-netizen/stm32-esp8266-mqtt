@@ -1,0 +1,25 @@
+# ---- 编译产物 ----
+build/
+Debug/
+Release/
+*.o
+*.d
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+*.su
+
+# ---- 编辑器 / 系统 ----
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini
+
+# ---- 本地临时文件 ----
+*.log
+*.tmp
+
+# 说明：.mxproject 与 stm32103.ioc 是 CubeMX 工程文件，请保留，方便用 CubeMX 打开改配置。

@@ -1,0 +1,16 @@
+# 统一换行符：源码按各平台习惯，Windows 脚本必须 CRLF
+# （注意：本工程 build.ps1 / flash.ps1 还必须是 UTF-8 带 BOM，否则 PowerShell 5.1 会解析失败）
+* text=auto
+*.ps1 text eol=crlf
+*.cmd text eol=crlf
+*.bat text eol=crlf
+
+# 二进制文件不要参与文本转换
+*.png binary
+*.jpg binary
+*.ico binary
+*.a   binary
+*.o   binary
+*.elf binary
+*.bin binary
+*.hex binary
