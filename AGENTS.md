@@ -24,6 +24,8 @@
 | `library/esp_port.h` | 移植层接口（5 个函数指针） | 加字段要同步改所有 `port/*.c` |
 | `port/esp_port_stm32f1.[ch]` | STM32F1 移植实现 | 平台相关，勿把平台代码混进 `library/` |
 | `examples/stm32f103c8t6/` | 可跑 demo（CubeMX 骨架 + `demo_app.c` + `freertos.c`） | 业务示例，随便改 |
+| `examples/.../Makefile` | 构建主体（CubeMX「Makefile」工具链的形状） | 可由 CubeMX 重新生成覆盖 |
+| `examples/.../Makefile.user` | **我们自加的源文件与包含路径** | 新增 `.c` / `-I` 写这里，不受 CubeMX 影响 |
 
 **数据流（上行）**：业务任务 → `esp_net_publish()` 拷贝入队 → `net_pump_pub_queue()` 在联网任务里取出 → `mqtt_publish()` → `net_transport_write()` → `esp_at_send()` → 串口 → ESP8266。
 **数据流（下行）**：串口 IDLE 中断 → `esp_net_input()` → `esp8266_at` 的环形缓冲 → `esp_at_ring_take()` 里跑 `esp_at_watch_byte()`（掉线检测）→ `mqtt_poll()` 解包 → `net_on_publish()` → 先改变量表，再转用户回调。
@@ -34,8 +36,8 @@
 
 ```powershell
 cd examples\stm32f103c8t6
-.\build.ps1                      # 必须 -Wall 无警告
-.\flash.ps1                      # 期望 ** Verified OK **
+mingw32-make -j8                 # 必须 -Wall 无警告
+mingw32-make flash               # 编译并烧录，期望 ** Verified OK **
 ```
 
 抓串口看是否真的联网（换成本机实际 COM 口）：
@@ -61,7 +63,7 @@ $code | D:\Python\python.exe -
 
 本机测试环境：EMQX 在 `D:\emqx-5.0.8-windows-amd64`（`bin\emqx.cmd start|stop`），Windows 移动热点网关 `192.168.137.1`，MQTT 客户端可用 MQTTX 或 python paho。
 
-> 编译产物的内存基线：**FLASH 37892 B / RAM 14728 B**（Debug）。RAM 已到 71.9%，**新增缓冲/任务前先算内存**。
+> 编译产物的内存基线：**Debug FLASH 37896 B / RAM 14728 B**，Release FLASH 25892 B / RAM 14720 B。RAM 已到 71.9%，**新增缓冲/任务前先算内存**。
 
 ---
 
@@ -75,14 +77,17 @@ $code | D:\Python\python.exe -
 | 4 | **`esp_at_watch_byte()` 开头的 `if (s_transparent == 0U) return;` 绝对不能删** | 透传模式之外（如 `AT+CIPCLOSE` 的应答）也会出现 `CLOSED`，误判会导致**无限 `+++` 退出透传**的活锁 |
 | 5 | **`library/` 内不得出现任何 HAL / 具体 RTOS 的调用** | 分层边界，一旦混入就无法移植到别的平台 |
 | 6 | **不联网时 `esp_net_publish()` 也必须能安全调用** | 它是入队语义，由联网任务在恢复后补发 |
-| 7 | **`examples/.../build.ps1` 的 `$Sources` / `$Includes` 是显式清单** | 新增 `.c` 必须手动加进去，否则链接 `undefined reference` |
-| 8 | **`build.ps1` / `flash.ps1` 必须保存为 UTF-8 with BOM** | Windows PowerShell 5.1 会按 GBK 解析无 BOM 文件，中文注释直接引发语法错误 |
+| 7 | **新增 `.c` 必须写进 `examples/.../Makefile.user`**，不要写进 `Makefile` | 漏加会链接 `undefined reference`；而写进 `Makefile` 的内容会在下次 CubeMX 重新生成时静默丢失 |
+| 8 | **`flash.ps1` 必须保存为 UTF-8 with BOM**；`Makefile` / `.cmd` **必须不带 BOM** | PowerShell 5.1 按 GBK 解析无 BOM 的 `.ps1`，中文注释直接语法错误；反过来 BOM 会被 `make` / `cmd` 当成内容，导致 "missing separator" 之类错误 |
 | 9 | **调 OpenOCD 用相对路径** | OpenOCD 对含中文的绝对路径处理不好 |
 | 10 | **`Core/` 里只有 `USER CODE BEGIN/END` 段内的代码是安全的** | 其余部分被 CubeMX 重新生成时覆盖；PA8 配置、`printf` 重定向、任务创建都在 USER CODE 段里 |
 
 ---
 
 ## 4. 常见修改配方
+
+**加一个 .c 文件**
+加到 `examples/stm32f103c8t6/Makefile.user` 的 `C_SOURCES`（**不要**写进 `Makefile`），然后 `mingw32-make -j8` 确认能编过、内存基线没异常增长。
 
 **加一个对外 API**
 1. `library/esp_net.h` 加声明 + 中文注释（含 `@retval`）；2. `library/esp_net.c` 加实现（涉及共享状态的要考虑中断/任务并发）；3. 在 `examples/.../demo_app.c` 里用一次；4. 更新根 `README.md` 的 API 表。
@@ -115,7 +120,10 @@ $code | D:\Python\python.exe -
 
 ## 6. 已知未解 / 注意点
 
-- **CMake 流程本机跑不通**：CubeMX 生成的 CMake 工程在 ASM 识别阶段崩溃（`0xC0000409`，与 CMake/Ninja 版本组合有关）。主力编译方式是 `build.ps1`；`CMakeLists.txt` 仅作保留，改动 `build.ps1` 的源清单时**也要同步改 `cmake/stm32cubemx/CMakeLists.txt`**，避免两者长期不一致。
+- **构建已从 CMake 换到 Makefile**：`.ioc` 的 `ProjectManager.TargetToolchain` 已由 `CMake` 改为 `Makefile`（原先选错工具链生成成了 CMake），`CMakeLists.txt` / `CMakePresets.json` / `cmake/` 已**全部删除**。现在只有一套构建：`Makefile`（CubeMX 管）+ `Makefile.user`（我们管）。
+  **CubeMX 重新生成会覆盖 `Makefile`**，届时只需把 `-include Makefile.user` 这一行补回（位置：紧跟 `C_INCLUDES` 定义之后），`Makefile.user` 不受影响。细节见 `examples/stm32f103c8t6/README.md` §3.3。
+- **本机 `C:\MinGW\bin` 里只有 `make`，没有 `sh` / `rm`**，所以 `Makefile` 的建目录与 `clean` 写成 cmd 兼容形式（`if not exist ... mkdir` / `rmdir /S /Q`），**不能**照抄 CubeMX 原生 Makefile 里的 `-rm -fR`。改这两条规则时要保持 cmd 兼容。
+- **`Makefile` 不随编译选项自动失效**：目标文件以 `Makefile` / `Makefile.user` 为依赖，改这两个文件会触发全量重编；但用命令行变量（如 `TOOLCHAIN=...`）临时改选项不会。Debug / Release 各走 `build/Debug`、`build/Release`，互不干扰。
 - **`Drivers/` 与 `Middlewares/` 是第三方代码**（ST HAL / CMSIS / FreeRTOS），随仓库提交只为「克隆即可编译」。**不要修改它们**，升级请走 CubeMX。
-- **工具链是 GCC 5.2.1**（很老），`STM32F103XX_FLASH.ld` 里的 `(READONLY)` 已被删除、`-mthumb` 已补上。用 CubeMX 重新生成会覆盖这两处，需重新改。
+- **工具链是 GCC 5.2.1**（很老）：`STM32F103XX_FLASH.ld` 里的 `(READONLY)` 已删除，`-mthumb` 已写进 `Makefile` 的 `MCU`。用 CubeMX 重新生成会覆盖这两个文件，需按 `examples/.../README.md` §3.3 / §3.4 补回。
 - 上行队列满时 `esp_net_publish()` 返回 `-1` 并丢弃本条，属设计行为（不阻塞业务任务）。

@@ -1,0 +1,26 @@
+##############################################################################
+# Makefile.user — esp-net-framework 自加的编译内容
+#
+# 这个文件是「我们管的部分」。CubeMX 不认识也不生成它，所以**用 CubeMX 重新
+# 生成代码时不会被覆盖**。
+#
+# 唯一需要在重新生成后补回的是主 Makefile 里的这一行（CubeMX 会覆盖主 Makefile）：
+#     -include Makefile.user
+# 位置：紧跟在 C_INCLUDES 定义之后。
+#
+# 新增自己的源文件时，往下加一行即可。
+##############################################################################
+
+# 框架本体 + 移植层 + demo 业务
+#   ../../library  = 平台无关的联网框架（esp_net / esp8266_at / mqtt_client）
+#   ../../port     = STM32F1 移植层（USART2 DMA 循环 + IDLE 中断 + PA8 复位）
+C_SOURCES += \
+../../library/esp8266_at.c \
+../../library/mqtt_client.c \
+../../library/esp_net.c \
+../../port/esp_port_stm32f1.c \
+Core/Src/demo_app.c
+
+C_INCLUDES += \
+-I../../library \
+-I../../port

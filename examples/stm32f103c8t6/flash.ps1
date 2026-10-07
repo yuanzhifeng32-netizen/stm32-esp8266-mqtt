@@ -64,7 +64,7 @@ try {
     }
 
     $Target = if ($File) { $File } else { "build/$Config/stm32103.elf" }
-    if (-not (Test-Path $Target)) { throw "找不到固件 $Target，请先运行 build.ps1。" }
+    if (-not (Test-Path $Target)) { throw "找不到固件 $Target，请先运行 mingw32-make 编译。" }
     # OpenOCD 对含中文的绝对路径不友好，统一转成相对路径（脚本已切到工程根目录）
     $Target = (Resolve-Path $Target).Path.Substring($Root.Length).TrimStart('\', '/') -replace '\\', '/'
 

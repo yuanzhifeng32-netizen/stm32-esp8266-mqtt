@@ -14,19 +14,22 @@
 在本目录下：
 
 ```bat
-build.cmd          :: 编译，产物在 build\Debug\
+build.cmd          :: 编译（Debug），产物在 build\Debug\
 flash.cmd          :: 用 ST-Link 烧录（含校验和复位）
 ```
 
-或者用 PowerShell：
+也可以直接敲 make：
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File .\build.ps1
-powershell -ExecutionPolicy Bypass -File .\flash.ps1
+mingw32-make                  # Debug（默认）
+mingw32-make CONFIG=Release   # Release
+mingw32-make -j8              # 并行编译
+mingw32-make clean            # 删除 build\
+mingw32-make flash            # 编译 + 烧录
 ```
 
-> 本机 PowerShell 执行策略禁止直接运行 `.ps1`，所以要么用 `.cmd`（已内置 `-ExecutionPolicy Bypass`），要么自己加参数。
-> `.ps1` 必须保存为 **UTF-8 带 BOM**，否则 Windows PowerShell 5.1 会按 GBK 解码中文注释，直接语法报错（本工程两个脚本已带 BOM）。
+> 需要 PATH 里有 **GNU Make**（本机是 `C:\MinGW\bin\mingw32-make.exe`，`build.cmd` 会先检查并给出提示）。
+> `flash.ps1` 是 PowerShell 脚本，必须保存为 **UTF-8 带 BOM**，否则 Windows PowerShell 5.1 会按 GBK 解码中文注释、直接语法报错（本工程已带 BOM）。
 
 跑起来之前**必须先改** [library/esp_net_config.h](../../library/esp_net_config.h) 里的 WiFi 与 MQTT 服务器地址，否则会一直打印 `wifi join failed`。
 
@@ -47,10 +50,11 @@ examples/stm32f103c8t6/
 ├─ startup_stm32f103xb.s         启动文件（向量表 / Reset_Handler）
 ├─ STM32F103XX_FLASH.ld          链接脚本
 ├─ stm32103.ioc                  CubeMX 工程文件（改引脚/外设就改它再重新生成）
-├─ CMakeLists.txt / cmake/       CubeMX 生成的 CMake 工程（本机跑不通，见 §4.3）
-├─ build.ps1  build.cmd          ★ 实际使用的编译脚本（不依赖 CMake）
+├─ Makefile                      ★ 构建主体（CubeMX「Makefile」工具链的形状，可被重新生成）
+├─ Makefile.user                 ★ 我们自加的源文件/包含路径（CubeMX 不认识，重新生成不会被覆盖）
+├─ build.cmd                     ★ 双击即可编译（内部调 mingw32-make）
 ├─ flash.ps1  flash.cmd          ★ ST-Link 烧录脚本
-└─ build/                        输出目录（编译产物，已 gitignore）
+└─ build/                        输出目录（build\Debug、build\Release，已 gitignore）
 ```
 
 `Drivers/` 与 `Middlewares/` 是**第三方代码**，随工程一起提交只是为了「克隆即可编译」；改配置不要动它们。
@@ -90,6 +94,7 @@ examples/stm32f103c8t6/
 | binutils / objcopy / size | 同目录 `arm-none-eabi-objcopy.exe`、`arm-none-eabi-size.exe` | GNU ld **2.25.90** |
 | 烧录/调试 | `D:\twBlock\toolchains\xpack-openocd-0.12.0-7-win32-x64\bin\openocd.exe` | OpenOCD **0.12.0** |
 | OpenOCD 脚本目录 | `...\xpack-openocd-0.12.0-7-win32-x64\openocd\scripts` | `interface/stlink.cfg`、`target/stm32f1x.cfg` |
+| **GNU Make（构建）** | `C:\MinGW\bin\mingw32-make.exe` | GNU Make **4.2.1**（x86_64-w64-mingw32） |
 | Python（抓串口用） | `D:\Python\python.exe` | 3.14.2，已装 pyserial 3.5 |
 | `stm32flash`（串口 ISP 备用） | `D:\twBlock\apm32f103\tools\stm32flash.exe` | — |
 
@@ -110,11 +115,12 @@ $env:OPENOCD_EXE  = 'D:\别的路径\openocd.exe'
 
 ## 3. 编译
 
-### 3.1 方式一：一键脚本（推荐，已实测通过）
+### 3.1 方式一：make（推荐，已实测通过）
 
 ```powershell
-.\build.cmd                    # Debug：-O0 -g3 -DDEBUG
-.\build.cmd Release            # Release：-Os -g0
+mingw32-make                  # Debug：-O0 -g3 -DDEBUG（默认）
+mingw32-make CONFIG=Release   # Release：-Os -g0
+mingw32-make -j8              # 并行
 ```
 
 产物（`build\<配置>\`）：
@@ -129,16 +135,20 @@ $env:OPENOCD_EXE  = 'D:\别的路径\openocd.exe'
 本机实测结果（重构为 library/port 分层之后）：
 
 ```
-Debug : FLASH 37892 B / 64 KB (57.82%)   RAM 14728 B / 20 KB (71.91%)
+Debug   : FLASH 37896 B / 64 KB (57.82%)   RAM 14728 B / 20 KB (71.91%)
+Release : FLASH 25892 B / 64 KB (39.51%)   RAM 14720 B / 20 KB (71.88%)
 ```
 
-`-Wall` **无警告**。
+`-Wall` **无警告**。Debug 与 Release 各自输出到独立目录，切换配置不会混用旧的目标文件。
 
-> `.ps1` 里的 `$Sources` / `$Includes` 是**显式清单**（不是通配符），所以**新增 .c 文件必须手动加进去**，否则链接报 `undefined reference`。这是本工程最容易踩的坑。
+> **新增自己的 .c 文件时，写到 `Makefile.user`，不要写进 `Makefile`。**
+> 理由：`Makefile` 是 CubeMX 能重新生成的文件（见 §3.3），写进去会被覆盖；`Makefile.user` 不会被碰。
+> 忘了加会导致链接报 `undefined reference`。
 
-### 3.2 方式二：手动敲命令（理解原理，不用脚本）
+### 3.2 方式二：手动敲命令（了解原理 / 没有 make 的环境）
 
-在本目录执行下面 4 步即可。
+在本目录执行下面 4 步即可。清单与 `Makefile` / `Makefile.user` 保持一致
+（**唯一权威是 `Makefile` 与 `Makefile.user`**；想看 make 实际发出的完整命令：`mingw32-make -n | Select-String 'arm-none-eabi-gcc'`）。
 
 **第 1 步 · 定义公共参数**（PowerShell 数组，避免路径被拆坏）：
 
@@ -222,36 +232,38 @@ New-Item -ItemType Directory -Force build\Debug | Out-Null
 & 'D:\twBlock\toolchains\gcc-arm\bin\arm-none-eabi-size.exe' build/Debug/stm32103.elf
 ```
 
-### 3.3 方式三：工程自带的 CMake 流程
+### 3.3 用 CubeMX 重新生成代码时要注意什么
 
-工程是 CubeMX 用「CMake」工具链生成的，官方流程是：
+工程的 `.ioc` 已把工具链设为 **Makefile**（`ProjectManager.TargetToolchain=Makefile`），
+所以以后用 CubeMX 重新生成时，它会产出一份**属于它的 `Makefile`，并覆盖本目录现有的 `Makefile`**。
 
-```powershell
-$env:PATH = 'D:\twBlock\toolchains\gcc-arm\bin;D:\Espressif\tools\ninja\1.12.1;' + $env:PATH
-cmake --preset Debug
-cmake --build --preset Debug
+好在我们已经把「CubeMX 管的部分」和「我们管的部分」分开了：
+
+| 谁管 | 文件 | 重新生成后 |
+|---|---|---|
+| CubeMX | `Makefile`（主体：Core / Drivers / Middlewares 的源清单与包含路径） | 被覆盖 |
+| 我们 | `Makefile.user`（`../../library`、`../../port`、`demo_app.c`） | **不受影响** |
+
+所以重新生成后只需要做一件事：**把这一行补回主 `Makefile`**（位置：紧跟 `C_INCLUDES` 定义之后），然后照常 `mingw32-make`：
+
+```makefile
+-include Makefile.user
 ```
 
-> **本机实测：这条路走不通**，与工程本身无关，是环境组合问题：
-> 1. CMake 配置阶段在**汇编器（ASM）识别**时 `cmake.exe` 崩溃（退出码 `0xC0000409`，CMake 3.30.5 与 4.0.3 都一样）；
-> 2. `cmake` 使用 **Ninja 生成器**时连最简单的 C 工程也崩溃，换 `-G "Unix Makefiles"` 则正常（但 ASM 那步仍崩）。
->
-> 所以本工程用 §3.1 的直接编译脚本作为主力方案。CMake 那份文件仅作保留（若换到 CMake 正常的电脑，改完 §3.4 的两处即可工作）。
+另见 §3.4。
 
-### 3.4 为适配 GCC 5.2.1 做的两处修改（重要）
+### 3.4 为适配 GCC 5.2.1（很老）需要注意的两处
 
-**① `cmake/gcc-arm-none-eabi.cmake`：补上 `-mthumb`**
+**① 编译必须带 `-mthumb`**
 
-```diff
--set(TARGET_FLAGS "-mcpu=cortex-m3 ")
-+set(TARGET_FLAGS "-mcpu=cortex-m3 -mthumb ")
-```
-
-原因：Cortex-M3 是**纯 Thumb 内核**。本机这套 GCC 默认按 ARM 模式编译，会直接报错：
+原因：Cortex-M3 是**纯 Thumb 内核**。本机这套 GCC 默认按 ARM 模式编译，缺了会直接报错：
 
 ```
 error: target CPU does not support ARM mode
 ```
+
+本工程已把它写进 `Makefile` 的 `MCU = -mcpu=cortex-m3 -mthumb`，用 make 不会遇到；
+只有自己手敲 `arm-none-eabi-gcc`（§3.2）时才要记得带上。
 
 **② `STM32F103XX_FLASH.ld`：删除 `(READONLY)` 段属性**
 
@@ -269,7 +281,8 @@ STM32F103XX_FLASH.ld:105: non constant or forward reference address expression f
 
 链接脚本自己的注释也写了「GCC10 或更早就删掉它」。删掉后对 GCC 11+ 同样合法，所以这个改动是安全的。
 
-> ⚠️ 如果以后用 CubeMX 重新生成代码，这两处会被覆盖回去，需要重新改（或换成 GCC 11+ 的工具链，那时第 ① 处仍需保留 `-mthumb`，第 ② 处可保留原样）。
+> ⚠️ 如果以后用 CubeMX 重新生成代码，`STM32F103XX_FLASH.ld` 与 `Makefile` 都会被覆盖：
+> 前者要把 `(READONLY)` 再删一遍（见 ② ），后者要把 §3.3 那一行 `-include Makefile.user` 补回。
 
 ---
 
@@ -554,13 +567,14 @@ $SF = 'D:\twBlock\apm32f103\tools\stm32flash.exe'
 
 | 现象 | 原因 / 解决 |
 |---|---|
-| `无法加载文件 build.ps1，因为在此系统上禁止运行脚本` | PowerShell 执行策略。用 `build.cmd`，或加 `-ExecutionPolicy Bypass` |
-| `.ps1` 报一堆 `Unexpected token` / 中文乱码 | 脚本没存成 **UTF-8 with BOM**。用「另存为 → UTF-8 带 BOM」重存 |
-| `undefined reference to 'esp_net_init'` 之类的链接错误 | 新增的 `.c` 没加进 `build.ps1` 的 `$Sources`（它是显式清单，不是通配符） |
-| `error: target CPU does not support ARM mode` | 缺 `-mthumb`（见 §3.4 ①） |
+| `'mingw32-make' 不是内部或外部命令` | PATH 里没有 GNU Make。装 MinGW 并把 `C:\MinGW\bin` 加进 PATH |
+| `无法加载文件 flash.ps1，因为在此系统上禁止运行脚本` | PowerShell 执行策略。用 `flash.cmd`，或给 pwsh 加 `-ExecutionPolicy Bypass` |
+| `flash.ps1` 报一堆 `Unexpected token` / 中文乱码 | 脚本没存成 **UTF-8 with BOM**。用「另存为 → UTF-8 带 BOM」重存 |
+| `undefined reference to 'esp_net_init'` 之类的链接错误 | 新增的 `.c` 没加进 `Makefile.user`（见 §3.1） |
+| `Makefile:108: *** CONFIG 只能是 Debug 或 Release，当前是 "xxx"` | `CONFIG=` 值拼错了，只能是 `Debug` 或 `Release` |
+| `error: target CPU does not support ARM mode` | 缺 `-mthumb`（`Makefile` 已带；手敲命令时见 §3.4 ①） |
 | `non constant or forward reference address expression for section .ARM.extab` | 链接脚本 `(READONLY)` 与老 binutils 不兼容（见 §3.4 ②） |
-| `undefined reference to '_exit'` | 链接时缺 `--specs=nano.specs`，或没把 `Core/Src/syscalls.c` 加进源文件列表 |
-| `cmake --preset Debug` 直接崩 | 见 §3.3，用 `build.cmd` 绕过 |
+| `undefined reference to '_exit'` | 链接时缺 `-specs=nano.specs`，或没把 `Core/Src/syscalls.c` 加进源文件列表 |
 
 **烧录 / ST-Link**
 
@@ -596,16 +610,22 @@ $SF = 'D:\twBlock\apm32f103\tools\stm32flash.exe'
 # ---- 进入本目录 ----
 cd '<仓库根>\examples\stm32f103c8t6'
 
-# ---- 编译（一键）----
-powershell -ExecutionPolicy Bypass -File .\build.ps1 -Config Debug
+# ---- 编译 ----
+mingw32-make                    # Debug（默认）
+mingw32-make CONFIG=Release     # Release
+mingw32-make -j8                # 并行
+mingw32-make clean
 # 或双击 build.cmd
 
-# ---- 烧录（一键）----
-powershell -ExecutionPolicy Bypass -File .\flash.ps1 -Config Debug
-# 或双击 flash.cmd
+# ---- 编译并烧录 ----
+mingw32-make flash -j8
+
+# ---- 只烧录（不重新编译）----
+.\flash.cmd
+.\flash.cmd -Config Release
 
 # ---- 只检测连接 ----
-powershell -ExecutionPolicy Bypass -File .\flash.ps1 -Probe
+.\flash.cmd -Probe
 
 # ---- 不依赖脚本，全程手动 ----
 $GCC = 'D:\twBlock\toolchains\gcc-arm\bin\arm-none-eabi-gcc.exe'
@@ -626,7 +646,7 @@ $SD  = 'D:\twBlock\toolchains\xpack-openocd-0.12.0-7-win32-x64\openocd\scripts'
 
 ## 9. 改动本 demo 时要注意的几件事
 
-1. **加 .c 文件必须同步改 `build.ps1` 的 `$Sources`**（显式清单，不会自动发现新文件）。
+1. **加 .c 文件要写进 `Makefile.user`**（`Makefile` 归 CubeMX 管，写进去会被重新生成覆盖）。
 2. **任务必须静态创建**（`configTOTAL_HEAP_SIZE` 只有 3072 B），别用动态 `osThreadNew` 之外的方式另开栈。
 3. **中断优先级必须 ≥ 5**（`configLIBRARY_MAX_SYSCALL_INTERRUPT_PRIORITY = 5`）。
 4. **`Core/` 下 `USER CODE BEGIN/END` 之外的代码会被 CubeMX 重新生成时覆盖**——PA8 配置、printf 重定向都在 USER CODE 段里，挪出去会丢。

@@ -35,6 +35,7 @@
     └─ stm32f103c8t6/           ← 完整可跑 demo（CubeMX 工程 + 一键编译/烧录脚本）
         ├─ README.md            ★ 本 demo 的编译烧录说明 / ST-Link 排错 FAQ
         ├─ Core/Src/demo_app.c  ★ 业务示例：周期上报 + 下行命令（先看这个）
+        ├─ Makefile / Makefile.user  ★ 构建（自加源文件写在 Makefile.user）
         └─ build.cmd / flash.cmd
 ```
 
@@ -194,9 +195,19 @@ A：库和 demo **全程零 `malloc`**，所有缓冲都是静态分配（大小
 
 ```bat
 cd examples\stm32f103c8t6
-build.cmd          :: 编译，产物在 build\Debug\
+build.cmd          :: 编译（Debug），产物在 build\Debug\
 flash.cmd          :: ST-Link 烧录（含校验与复位）
 ```
+
+也可以直接敲 make（`build.cmd` 就是它的包装）：
+
+```powershell
+mingw32-make                  # Debug（默认）
+mingw32-make CONFIG=Release   # Release
+mingw32-make flash            # 编译 + 烧录
+```
+
+需要 PATH 里有 GNU Make（本机是 `C:\MinGW\bin\mingw32-make.exe`）。
 
 串口 1（PA9/PA10，115200）会打印联网过程与每次上报，例如：
 

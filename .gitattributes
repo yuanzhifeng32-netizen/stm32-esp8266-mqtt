@@ -1,5 +1,7 @@
 # 统一换行符：源码按各平台习惯，Windows 脚本必须 CRLF
-# （注意：本工程 build.ps1 / flash.ps1 还必须是 UTF-8 带 BOM，否则 PowerShell 5.1 会解析失败）
+# 注意编码：
+#   flash.ps1 必须是 UTF-8 带 BOM（否则 PowerShell 5.1 按 GBK 解析中文注释会语法报错）
+#   Makefile / *.cmd 则必须**不带 BOM**（BOM 会被 make / cmd 当成内容）
 * text=auto
 *.ps1 text eol=crlf
 *.cmd text eol=crlf
