@@ -526,11 +526,15 @@ int esp_ws_connect(const char *host, uint16_t port, const char *path,
     (void)ws_b64(key, 16U, keyB64);
 
     /* ② 拼握手请求（HTTP 部分复用 esp_http） */
+    /* 注意 Sec-WebSocket-Protocol: mqtt 不能省：MQTT over WebSocket 规定子协议名叫
+       "mqtt"，EMQX 等 broker 在握手时会校验它，缺了直接回 400 Bad Request
+       （实测不带这个头 → 400，带上 → 101）。 */
     (void)snprintf(extra, sizeof(extra),
                    "Upgrade: websocket\r\n"
                    "Connection: Upgrade\r\n"
                    "Sec-WebSocket-Key: %s\r\n"
-                   "Sec-WebSocket-Version: 13\r\n",
+                   "Sec-WebSocket-Version: 13\r\n"
+                   "Sec-WebSocket-Protocol: mqtt\r\n",
                    keyB64);
 
     reqLen = esp_http_build("GET", path, host, port, extra, req, (uint16_t)sizeof(req));

@@ -5,6 +5,18 @@
 
 ---
 
+## 2026-10-08 — 修复：WebSocket 握手缺 `Sec-WebSocket-Protocol` 被 broker 拒绝
+
+**问题**：默认（WEBSOCKET）模式连不上，日志停在 `[net] websocket handshake failed`。
+
+**根因**（实测复现）：MQTT over WebSocket 规定子协议名为 `"mqtt"`，EMQX（Cowboy）在握手时校验它。`esp_ws_connect()` 的握手请求里**没带** `Sec-WebSocket-Protocol: mqtt`，EMQX 直接回 **`HTTP/1.1 400 Bad Request`**（`esp_http_status()` 读到的不是 101 → 握手判失败）。用原始 socket 验证：不带该头 → 400，带上 → 101。
+
+**修复**：`library/esp_ws.c` 的 `esp_ws_connect()` 在握手请求里补 `Sec-WebSocket-Protocol: mqtt`。
+
+**验证**：编译零 `-Wall` 警告；FLASH 44572 → **44604 B**（+32 B 字面量），RAM 不变 15632 B。⚠️ 板端端到端待硬件复跑（EMQX ws: 8083 `/mqtt`）。
+
+---
+
 ## 2026-10-08 — P2：MQTT over WebSocket（HTTP Upgrade + WS 帧）
 
 **目标**：让 MQTT 能跑在 `ws://` 上（很多云平台只开 8083 而不开裸 1883）。原 TCP 直连路径原样保留，用 `ESP_MQTT_TRANSPORT` **编译期**切换，**默认已设为 WEBSOCKET**。
@@ -15,7 +27,7 @@
 
 - `library/esp_http.[ch]` —— 极简 HTTP/1.1 客户端：拼请求 / 收响应头 / 解析状态码与头（可复用做 REST）。
 - `library/esp_ws.[ch]` —— WebSocket 客户端：随机 16 B → Base64 当 `Sec-WebSocket-Key` → HTTP Upgrade → 校验 `Sec-WebSocket-Accept`（自带 SHA-1 + Base64）；写出帧加**客户端掩码**、读入逐帧解析并就地处理 ping/close；**产出一个 `esp_stream_t`**，MQTT 完全无感。
-- `library/esp_net_config.h` —— 新增 `ESP_MQTT_TRANSPORT`（默认 TCP，行为不变）、`ESP_WS_PORT` / `ESP_WS_PATH` / `ESP_WS_HANDSHAKE_TIMEOUT_MS` / `ESP_WS_TX_BUFFER_SIZE` / `ESP_WS_RX_BUFFER_SIZE`。**只加宏，未删改任何旧宏。**
+- `library/esp_net_config.h` —— 新增 `ESP_MQTT_TRANSPORT`（默认 WEBSOCKET）、`ESP_WS_PORT` / `ESP_WS_PATH` / `ESP_WS_HANDSHAKE_TIMEOUT_MS` / `ESP_WS_TX_BUFFER_SIZE` / `ESP_WS_RX_BUFFER_SIZE`。**只加宏，未删改任何旧宏。**
 - `Makefile.user` 加入 `esp_http.c` / `esp_ws.c`。
 
 **接线**（`library/esp_net.c`）：WEBSOCKET 时 `esp_ws_init(&s_stream)` 后把 `esp_ws_stream()` 交给协议实现；建链时 TCP 连好后、MQTT CONNECT 前插入 `esp_ws_connect()`，失败即退出透传并重试。协议层（`esp_proto_mqtt.c` / `mqtt_client.c`）**一行未改**。
