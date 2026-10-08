@@ -48,6 +48,8 @@
 | `library/esp_net.c` | 编排：建链时序、在线循环、断线自愈、上行队列、下行分发 | 只准调 `esp_proto_t` 表，禁止直接调 `mqtt_*` |
 | `library/esp_proto.h` | 协议 vtable（`esp_proto_t`）+ `esp_stream_t` 字节流抽象 | 「换协议栈」的唯一接口点 |
 | `library/esp_proto_mqtt.[ch]` | 协议实现：MQTT 3.1.1（包住 `mqtt_client`） | 只认识 `esp_stream_t`，不得 include `esp8266_at.h` |
+| `library/esp_http.[ch]` | 内部：极简 HTTP/1.1 客户端（拼请求 / 收响应 / 解析头） | 内部实现，WebSocket 握手的地基 |
+| `library/esp_ws.[ch]` | 内部：WebSocket 客户端（HTTP Upgrade 握手 + 帧封/拆），**在 `esp_stream_t` 外再包一层** | 内部实现，不暴露进 `esp_net.h` |
 | `library/esp8266_at.[ch]` | 内部：AT 指令驱动 + 环形缓冲 + 分帧拆包 | 内部实现，不暴露进 `esp_net.h` |
 | `library/mqtt_client.[ch]` | 内部：MQTT 3.1.1 报文编解码 | 同上 |
 | `library/esp_port.h` | 移植层接口（5 个函数指针） | 加字段要同步改所有 `port/*.c` |
@@ -143,6 +145,42 @@ IPD_DATA  把接下来 <len> 个字节搬进数据缓冲 → 满 len 后回到 I
 
 结论：上行握手与下行接收互不干扰；代价只是分帧模式下每次发送要等一个 `>` 往返（`AT+CIPSEND=<len>` 的超时设为 5000 ms）。
 
+### 4.3 传输方式：直连 TCP vs MQTT over WebSocket
+
+`ESP_LINK_MODE` 决定**怎么跟 ESP8266 讲话**（透传/分帧）；`ESP_MQTT_TRANSPORT` 决定**MQTT 报文怎么送到服务器**（TCP / WebSocket）。两者正交、都要编译期选。当前默认：链路 `TRANSPARENT`、传输 `WEBSOCKET`（即 `ws://<host>:8083/mqtt`）。
+
+**WebSocket 是什么**：不是新端口、也不是新协议栈，只是"借一次 HTTP 请求把 TCP 升级成帧通道"：
+
+```
+客户端 ── GET <path>  Upgrade: websocket  Sec-WebSocket-Key: <随机16B的Base64> ──> 服务器
+客户端 <── HTTP/1.1 101 Switching Protocols  Sec-WebSocket-Accept: <校验值> ────── 服务器
+        ── 之后这条 TCP 上跑的就是 WebSocket 帧（binary / text / ping / close）──>
+```
+
+- 校验值 = `Base64(SHA1(key + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"))`，客户端要算出来跟服务器回的比。SHA-1 / Base64 都是 `esp_ws.c` 自带的小实现（不为这点功能拉依赖）。
+- 客户端发出的帧**必须加掩码**（4 字节 mask，载荷每字节 `^ mask[i%4]`）；服务器发来的帧不加掩码。ping 要回 pong，close 视为链路断开（触发重连）。
+
+**它怎么插进架构**：`esp_ws.c` **本身就是一个 `esp_stream_t`**——写的时候做帧封装加掩码，读的时候拆帧。`esp_net.c` 在 `ESP_MQTT_TRANSPORT = WEBSOCKET` 时把这根"带帧的流"交给 MQTT：
+
+```
+esp_net.c ─> esp_ws_stream() ─(帧封/拆)─> 底层 esp_stream_t(TCP) ─> ESP8266
+                      握手只在建链时做一次（TCP 连好后、MQTT CONNECT 前）
+```
+
+于是 **MQTT 一行都不用改**（`esp_proto_mqtt.c` / `mqtt_client.c` 不知道底下是 TCP 还是 WebSocket）。换来的好处：很多云平台只开放 `ws://8083` 而不开放裸 `1883`，这套代码可以直接连。
+
+**配置**（都在 `esp_net_config.h`，只加不改）：
+
+```c
+#define ESP_MQTT_TRANSPORT           ESP_MQTT_TRANSPORT_WEBSOCKET  /* 默认；改 ESP_MQTT_TRANSPORT_TCP 可直连 1883 */
+#define ESP_WS_PORT                  8083U     /* EMQX ws 默认端口 */
+#define ESP_WS_PATH                  "/mqtt"   /* EMQX ws 默认路径 */
+```
+
+**只支持明文 `ws://`**：板载 AT 固件 v1.2.0.0 没有 TLS socket，`wss://`（需要 `AT+CIPSTART="SSL"`）用不了。
+
+**内存**：TCP 模式下 `--gc-sections` 会把 WS 的代码与缓冲整体丢弃（零开销）；只有真正切到 WEBSOCKET 才多占 ~840 B RAM（`ESP_WS_TX/RX_BUFFER_SIZE`）。
+
 ---
 
 ## 5. 断线自愈是怎么做的
@@ -175,16 +213,20 @@ IPD_DATA  把接下来 <len> 个字节搬进数据缓冲 → 满 len 后回到 I
 | `ESP_NET_RX_BUFFER_SIZE` | 512 B | 库接收环形缓冲（AT 应答文本） |
 | `ESP_AT_DATA_BUFFER_SIZE` | 512 B | **仅分帧**：TCP 载荷专用缓冲 |
 | `ESP_NET_PUB_QUEUE_LEN` × 单条 | 4 × (32+128) | 上行发布队列 |
+| `ESP_WS_TX_BUFFER_SIZE` | 320 B | **仅 WebSocket**：发帧时给载荷做掩码的临时区 |
+| `ESP_WS_RX_BUFFER_SIZE` | 512 B | **仅 WebSocket**：拆帧后攒的载荷（握手响应也复用这条） |
 
-编译产物基线（Debug）：
+编译产物基线（Debug）。**注意链路模式与传输方式都会影响数字**，比对时先看列：
 
-| 版本 | FLASH | RAM |
-|---|---|---|
-| 初始基线 | 37896 B | 14728 B |
-| P1 协议解耦 | 38544 B | 14776 B |
-| + 分帧接收修复（含 512 B 数据缓冲） | 39444 B | 15312 B (74.77%) |
+| 版本 | 链路模式 | 传输 | FLASH | RAM |
+|---|---|---|---|---|
+| 初始基线 | 透传 | TCP | 37896 B | 14728 B |
+| P1 协议解耦 | 透传 | TCP | 38544 B | 14776 B |
+| + 分帧接收修复（含 512 B 数据缓冲） | 分帧 | TCP | 39444 B | 15312 B (74.77%) |
+| + MQTT over WebSocket | 透传 | TCP | 38752 B | 14792 B (72.23%) |
+| + MQTT over WebSocket | 透传 | WEBSOCKET（默认） | 44572 B | 15632 B (76.33%) |
 
-> RAM 已到 ~75%，**新增缓冲 / 任务前先算内存**。
+> RAM 已到 ~75%，**新增缓冲 / 任务前先算内存**。TCP 传输下 WS 的代码与缓冲会被 `--gc-sections` 丢弃，所以开不开 WS 代码对 TCP 模式几乎无影响；只有 `ESP_MQTT_TRANSPORT = WEBSOCKET` 时才真正多占那 ~840 B。
 
 ---
 
@@ -204,6 +246,10 @@ IPD_DATA  把接下来 <len> 个字节搬进数据缓冲 → 满 len 后回到 I
 5. `esp_net.c` **一行都不用改**。
 
 > 返回值约定见 `esp_proto.h`：`<0` 一律当链路错误（触发重连）；`publish` 的 `>0` 表示报文本身有问题（丢该条、不断链）。
+
+**把 MQTT 从直连 TCP 切到 WebSocket**：只改 `esp_net_config.h` 一行 `#define ESP_MQTT_TRANSPORT ESP_MQTT_TRANSPORT_WEBSOCKET`（并按需改 `ESP_WS_PORT` / `ESP_WS_PATH`）。**协议层与 `esp_net.c` 都不用动** —— WS 只是在 `esp_stream_t` 外又包了一层。原理见 §4.3。
+
+**在别的协议里复用 HTTP 客户端**：`esp_http.[ch]` 的 `esp_http_build()` / `esp_http_recv()` / `esp_http_status()` / `esp_http_header()` 是通用的，可以拿来做 REST（发 GET/POST 上报）。
 
 **移植到新平台**：新建 `port/esp_port_<平台>.c` 实现 `esp_port_t` 的 5 个函数 → 在串口接收处调 `esp_net_input()`（见 §3）→ **不改 `library/` 任何文件**。
 
@@ -234,6 +280,8 @@ A：全程零 `malloc`，缓冲大小都在 `esp_net_config.h`；任务用 `Stat
 ## 9. 已知限制 / 潜在问题
 
 - **`ESP_LINK_MODE` 是编译期二选一**，没有运行期自动切换。分帧修复后两种模式代码都在，但**最近一次硬件回归只覆盖了分帧模式**，透传模式是等价替换（编译通过）后未重跑硬件。
+- **MQTT over WebSocket（`ESP_MQTT_TRANSPORT`）只做了编译验证，未做硬件端到端**。用前需确认 EMQX 的 ws 监听已开（默认 8083 / 路径 `/mqtt`）。只支持明文 `ws://`，不支持 `wss://`。
+- **WebSocket 单帧上限 = `ESP_WS_RX_BUFFER_SIZE`（512 B）**：服务器发来超过这个长度的单帧会被判错并触发重连。正常 MQTT（尤其本库 TX/RX 缓冲都 ≤ 256 B）不会碰到；若将来要收大包，调大它。
 - **分帧模式下行缓冲 `ESP_AT_DATA_BUFFER_SIZE` 满时丢新字节**。若下行突发流量大，调大它。
 - **环形缓冲是单生产者单消费者**。若你想从多个任务同时调 `esp_net_input()`，需要自己加锁——正常用法（只有中断喂数据）不需要。
 - **`esp_at_expect()` 的应答累积缓冲 512 B**（`ESP_AT_RESP_BUFFER_SIZE`），超长应答会被截断，仅影响解析，不影响数据通路。

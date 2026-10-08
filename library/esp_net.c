@@ -21,6 +21,7 @@
 #include "esp8266_at.h"
 #include "esp_proto.h"
 #include "esp_proto_mqtt.h"
+#include "esp_ws.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -115,6 +116,11 @@ static const esp_stream_t s_stream =
     net_transport_write,
     net_transport_read,
 };
+
+/* 真正交给协议实现的流。默认就是上面这根 TCP 流；当 ESP_MQTT_TRANSPORT 选
+   WebSocket 时，esp_net_init() 会把它换成 esp_ws_stream()（在 TCP 流外再包一层
+   WebSocket 帧）。对协议实现而言两者一模一样 —— 都是 write/read。 */
+static const esp_stream_t *s_activeStream = &s_stream;
 
 /* ------------------------------------------------------------ 下行命令处理 */
 
@@ -461,6 +467,7 @@ static int net_link_up(void)
 {
     s_online = 0U;
     s_proto->reset(s_protoCtx);
+    esp_ws_reset();
     esp_at_clear_link_closed();
 
     /* ① 回到 AT 指令模式：先退透传，再探活；卡死才硬复位 */
@@ -489,6 +496,22 @@ static int net_link_up(void)
     {
         return -1;
     }
+
+#if (ESP_MQTT_TRANSPORT == ESP_MQTT_TRANSPORT_WEBSOCKET)
+    /* 用 WebSocket 时，TCP 建好之后要先做一次 HTTP Upgrade 握手，
+       握手成功这根 TCP 才变成 WebSocket 通道，MQTT 才能往上跑。 */
+    if (esp_ws_connect(s_cfg.host, s_cfg.port, ESP_WS_PATH,
+                       ESP_WS_HANDSHAKE_TIMEOUT_MS) != 0)
+    {
+        ESP_LOG("[net] websocket handshake failed\r\n");
+        if (esp_at_is_transparent() != 0U)
+        {
+            (void)esp_at_exit_transparent();
+        }
+        return -1;
+    }
+#endif
+
     if (s_proto->connect(s_protoCtx, &s_cfg) != 0)
     {
         /* 协议没起来，但模块此时还停在透传里（TCP 是活的，只是服务器不理）。
@@ -623,7 +646,11 @@ void esp_net_init(const esp_port_t *port)
 
     /* 建链参数：从配置宏组装一次，之后协议实现只认这个结构体（不必认识那些宏） */
     s_cfg.host            = ESP_MQTT_HOST;
+#if (ESP_MQTT_TRANSPORT == ESP_MQTT_TRANSPORT_WEBSOCKET)
+    s_cfg.port            = (uint16_t)ESP_WS_PORT;
+#else
     s_cfg.port            = (uint16_t)ESP_MQTT_PORT;
+#endif
     s_cfg.client_id       = ESP_MQTT_CLIENT_ID;
     s_cfg.user            = (ESP_MQTT_USERNAME[0] != '\0') ? ESP_MQTT_USERNAME : NULL;
     s_cfg.pass            = (ESP_MQTT_PASSWORD[0] != '\0') ? ESP_MQTT_PASSWORD : NULL;
@@ -632,9 +659,23 @@ void esp_net_init(const esp_port_t *port)
     s_cfg.ping_period_ms  = ESP_MQTT_PING_PERIOD_MS;
     s_cfg.recv_timeout_ms = 50U;   /* 在线循环单次 poll 的阻塞上限（与改前一致） */
 
+#if (ESP_MQTT_TRANSPORT == ESP_MQTT_TRANSPORT_WEBSOCKET)
+    /* 传输方式 2：MQTT over WebSocket。
+       先在 TCP 流外面包一层 WebSocket，之后协议实现拿到的是"带帧的流"——
+       MQTT 的实现完全不变，它并不知道底下是 WebSocket。 */
+    esp_ws_init(&s_stream);
+    s_activeStream = esp_ws_stream();
+    ESP_LOG("[net] transport: websocket ws://%s:%u%s\r\n",
+            ESP_MQTT_HOST, (unsigned)ESP_WS_PORT, ESP_WS_PATH);
+#else
+    /* 传输方式 1：直连 TCP（默认） */
+    s_activeStream = &s_stream;
+    ESP_LOG("[net] transport: tcp %s:%u\r\n", ESP_MQTT_HOST, (unsigned)ESP_MQTT_PORT);
+#endif
+
     /* 把它自己的收发缓冲与字节流交给协议实现；
        下行消息统一进 net_on_publish()：命令主题 → 改变量，再转给用户回调。 */
-    (void)s_proto->init(&s_protoCtx, &s_stream,
+    (void)s_proto->init(&s_protoCtx, s_activeStream,
                         s_protoTxBuffer, (uint16_t)sizeof(s_protoTxBuffer),
                         s_protoRxBuffer, (uint16_t)sizeof(s_protoRxBuffer),
                         net_on_publish);

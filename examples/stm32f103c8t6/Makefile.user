@@ -18,6 +18,8 @@ C_SOURCES += \
 ../../library/esp8266_at.c \
 ../../library/mqtt_client.c \
 ../../library/esp_proto_mqtt.c \
+../../library/esp_http.c \
+../../library/esp_ws.c \
 ../../library/esp_net.c \
 ../../port/esp_port_stm32f1.c \
 Core/Src/demo_app.c

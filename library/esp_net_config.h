@@ -63,6 +63,34 @@
 #define ESP_NET_RETRY_MS            5000U
 
 /* ==========================================================================
+ * 2b. 传输方式：直连 TCP，还是 MQTT over WebSocket
+ * ========================================================================== */
+/* 两者对上层完全一样（都是 MQTT），区别只在"字节怎么送到服务器"：
+ *   TCP        ：AT+CIPSTART="TCP" 直连 broker 的 1883（最简单）
+ *   WEBSOCKET  ：先跟服务器做一次 HTTP Upgrade 握手，之后在 TCP 上跑带帧格式的
+ *                WebSocket 字节流（很多云平台只开放 ws://8083 而不开放裸 1883）。**默认**
+ * 只支持**明文** ws:// —— 板载 AT 固件 v1.2.0.0 不支持 TLS socket，wss:// 用不了。 */
+#define ESP_MQTT_TRANSPORT_TCP       0
+#define ESP_MQTT_TRANSPORT_WEBSOCKET 1
+
+/* 默认走 MQTT over WebSocket（连 ws://8083）。想直连裸 TCP（1883）就改成 ESP_MQTT_TRANSPORT_TCP */
+#define ESP_MQTT_TRANSPORT           ESP_MQTT_TRANSPORT_WEBSOCKET
+
+/* WebSocket 端口与路径：EMQX 默认监听 8083，路径 /mqtt。
+   host 复用上面的 ESP_MQTT_HOST，这里只管端口和路径。 */
+#define ESP_WS_PORT                  8083U
+#define ESP_WS_PATH                  "/mqtt"
+/* WebSocket 握手（HTTP Upgrade）超时 */
+#define ESP_WS_HANDSHAKE_TIMEOUT_MS  5000U
+
+/* WebSocket 相关缓冲（都是静态分配）：
+   - TX：发一帧时给载荷做掩码（客户端发出的帧**必须**加掩码）用的临时区
+   - RX：拆一帧后攒下的载荷；一帧可能比 MQTT 单次读取大，所以要兜住一整帧
+   握手响应复用 RX 缓冲，不额外占用。 */
+#define ESP_WS_TX_BUFFER_SIZE        320U
+#define ESP_WS_RX_BUFFER_SIZE        512U
+
+/* ==========================================================================
  * 3. 缓冲大小（都是静态分配，按需调大即可）
  * ========================================================================== */
 /* MQTT 收发缓冲：一个 CONNECT 报文约 30 B，留 256 B 足够；
@@ -102,7 +130,7 @@
    多一层握手、慢，但每一步都能在串口上看见，适合排查问题。 */
 #define ESP_LINK_MODE_FRAME         0
 
-#define ESP_LINK_MODE               ESP_LINK_MODE_FRAME
+#define ESP_LINK_MODE               ESP_LINK_MODE_TRANSPARENT
 
 /* ==========================================================================
  * 5. 超时 / 时序

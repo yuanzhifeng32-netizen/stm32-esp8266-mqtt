@@ -26,7 +26,10 @@
 #define ESP_MQTT_CLIENT_ID   "stm32_esp01"   /* 同一 broker 上必须唯一 */
 #define ESP_NET_TOPIC_CMD    "stm32/down"    /* 库自动订阅它收下行命令 */
 #define ESP_LINK_MODE        ESP_LINK_MODE_TRANSPARENT  /* 或 ESP_LINK_MODE_FRAME */
+#define ESP_MQTT_TRANSPORT   ESP_MQTT_TRANSPORT_WEBSOCKET  /* 默认；直连裸 TCP 改成 ESP_MQTT_TRANSPORT_TCP */
 ```
+
+> **默认走 MQTT over WebSocket**（连 `ws://<host>:8083/mqtt`）。要直连裸 TCP（`1883`）就把 `ESP_MQTT_TRANSPORT` 改回 `ESP_MQTT_TRANSPORT_TCP`。ws 的端口/路径用 `ESP_WS_PORT` / `ESP_WS_PATH` 配（EMQX 默认 `8083` / `"/mqtt"`）。**MQTT 代码一行都不用动**，库只是把 TCP 通道包了一层 WebSocket。仅支持明文 `ws://`，`wss://` 因 AT 固件太老不支持。
 
 ### ② 移植 —— 实现 `esp_port_t` 的 5 个函数，并在串口接收处喂数据
 

@@ -5,6 +5,32 @@
 
 ---
 
+## 2026-10-08 — P2：MQTT over WebSocket（HTTP Upgrade + WS 帧）
+
+**目标**：让 MQTT 能跑在 `ws://` 上（很多云平台只开 8083 而不开裸 1883）。原 TCP 直连路径原样保留，用 `ESP_MQTT_TRANSPORT` **编译期**切换，**默认已设为 WEBSOCKET**。
+
+**原理**：WebSocket 不是新协议栈，只是"借一次 HTTP 请求把 TCP 升级成帧通道"。所以 = HTTP 握手 + 帧封/拆，底层仍是已有的 TCP 通路。
+
+**新增**：
+
+- `library/esp_http.[ch]` —— 极简 HTTP/1.1 客户端：拼请求 / 收响应头 / 解析状态码与头（可复用做 REST）。
+- `library/esp_ws.[ch]` —— WebSocket 客户端：随机 16 B → Base64 当 `Sec-WebSocket-Key` → HTTP Upgrade → 校验 `Sec-WebSocket-Accept`（自带 SHA-1 + Base64）；写出帧加**客户端掩码**、读入逐帧解析并就地处理 ping/close；**产出一个 `esp_stream_t`**，MQTT 完全无感。
+- `library/esp_net_config.h` —— 新增 `ESP_MQTT_TRANSPORT`（默认 TCP，行为不变）、`ESP_WS_PORT` / `ESP_WS_PATH` / `ESP_WS_HANDSHAKE_TIMEOUT_MS` / `ESP_WS_TX_BUFFER_SIZE` / `ESP_WS_RX_BUFFER_SIZE`。**只加宏，未删改任何旧宏。**
+- `Makefile.user` 加入 `esp_http.c` / `esp_ws.c`。
+
+**接线**（`library/esp_net.c`）：WEBSOCKET 时 `esp_ws_init(&s_stream)` 后把 `esp_ws_stream()` 交给协议实现；建链时 TCP 连好后、MQTT CONNECT 前插入 `esp_ws_connect()`，失败即退出透传并重试。协议层（`esp_proto_mqtt.c` / `mqtt_client.c`）**一行未改**。
+
+**验证**：两种传输模式均编译零 `-Wall` 警告。
+
+- TCP（透传链路，非默认）：FLASH **38752 B** / RAM **14792 B (72.23%)** —— 相比改动前的透传基线（37896/14728）只 +856 B FLASH / **+64 B RAM**：TCP 模式下 `--gc-sections` 把 WS 的代码与缓冲整体丢弃，几乎零开销。
+- WEBSOCKET（透传链路，**默认**）：FLASH **44572 B** / RAM **15632 B (76.33%)**（+5.8 KB FLASH / +840 B RAM）。
+- 注：上一版记录的 39444/15312 是**分帧链路**下的数字（多 512 B 分帧数据缓冲），不能与上面的透传数字直接相减。
+- ⚠️ **硬件端到端未验证**：需 EMQX 开启 ws 监听（默认 8083 / 路径 `/mqtt`）后，按 AGENTS.md §2 五判据跑（ONLINE / 周期上报 / 下行命令 / 停 broker 干净重试 / 重开自动恢复）。
+
+**限制**：只支持明文 `ws://` —— 板载 AT 固件 v1.2.0.0 无 TLS socket，`wss://` 不可用。
+
+---
+
 ## 2026-10-08 — 分帧模式收发修复（上行/下行隔离）
 
 **问题**：`ESP_LINK_MODE = FRAME` 时根本连不上服务器，日志停在 `[mqtt] CONNECT failed, status 3`。
