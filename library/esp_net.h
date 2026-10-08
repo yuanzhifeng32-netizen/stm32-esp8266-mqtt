@@ -10,6 +10,8 @@
  *      并在串口接收中断里把收到的字节喂给 esp_net_input()；
  *   3) 启动：调度器启动前调用 esp_net_init(&你的port)，
  *      然后开一个任务跑 esp_net_task()（内部死循环，负责联网与断线自愈）。
+ *      默认协议是 MQTT；想换协议栈（例如将来的 HTTP）就在 esp_net_init() 之前调
+ *      esp_net_set_proto(&你的协议)，协议接口见 esp_proto.h。
  *
  *   之后你自己的任务想干嘛干嘛，需要联网时：
  *       esp_net_publish("stm32/up", payload, len, 0, 0);   // 上行（线程安全）
@@ -24,6 +26,7 @@
 
 #include <stdint.h>
 #include "esp_port.h"
+#include "esp_proto.h"
 
 #ifdef __cplusplus
 extern "C" {
@@ -44,6 +47,15 @@ typedef void (*esp_net_msg_cb_t)(const char *topic, uint16_t topic_len,
  * @note   必须在 FreeRTOS 调度器启动**之前**调用一次（例如 MX_FREERTOS_Init 里）。
  */
 void esp_net_init(const esp_port_t *port);
+
+/**
+ * @brief  覆盖默认协议实现（默认是 MQTT）。必须在 esp_net_init() **之前**调用。
+ * @param  proto 指向一个生命周期覆盖整个运行期的 const esp_proto_t
+ *               （例如 &esp_proto_mqtt，或你自己实现的协议）
+ * @note   这是「换协议栈」的接口点：esp_net 的建链时序与在线循环都只看这张函数表，
+ *         不知道具体是 MQTT 还是 HTTP。传 NULL 会被忽略（保持原有设定）。
+ */
+void esp_net_set_proto(const esp_proto_t *proto);
 
 /**
  * @brief  把从 ESP8266 收到的字节喂给库。

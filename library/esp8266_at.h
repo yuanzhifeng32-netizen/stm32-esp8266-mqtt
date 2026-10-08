@@ -13,8 +13,12 @@
  * ---------------------------------------------------------------------------
  * 两种链路模式（见 esp_net_config.h 的 ESP_LINK_MODE）
  * ---------------------------------------------------------------------------
- *   透传 TRANSPARENT：进透传后 esp_at_read/esp_at_send 直接读写 TCP 裸字节流。
- *   分帧 FRAME      ：发送自动加 AT+CIPSEND=<len> 握手。
+ *   透传 TRANSPARENT：进透传后串口上只有 TCP 裸字节流，收发都是直通。
+ *   分帧 FRAME      ：发送自动加 AT+CIPSEND=<len> 握手（等 ">" 再发数据）；
+ *                     接收由驱动解析 "+IPD,<len>:" 前缀，把载荷挑出来。
+ *
+ *   两种模式下"取 TCP 载荷"都统一走 esp_at_read_data()；esp_at_read() 只取
+ *   AT 应答文本，供 esp_at_expect() 匹配 "OK" / ">" / "SEND OK" 用。
  *
  * 首发协议栈：MIT
  */
@@ -51,7 +55,11 @@ void esp_at_init(const esp_port_t *port);
  */
 void esp_at_input(const uint8_t *data, uint16_t len);
 
-/** @brief 丢弃缓冲里所有未读数据（发 AT 指令前先清场，避免读到上一条的残留） */
+/**
+ * @brief  彻底清场：丢弃 AT 应答文本 + 分帧模式的 TCP 载荷缓冲 + 拆包状态。
+ * @note   只在**重建链路**时用（复位模块 / 退出透传）。普通发 AT 指令不调它，
+ *         内部走的是只清 AT 文本的小函数，避免把已到达的下行数据一起丢掉。
+ */
 void esp_at_flush(void);
 
 /**
@@ -59,6 +67,15 @@ void esp_at_flush(void);
  * @retval 实际读到的字节数；0 表示超时没数据
  */
 uint16_t esp_at_read(uint8_t *dst, uint16_t max_len, uint32_t timeout_ms);
+
+/**
+ * @brief  读取 **TCP 载荷**（协议层只用这个，不要用 esp_at_read）。
+ * @note   透传模式：串口上就是裸字节流，等价于 esp_at_read()。
+ *         分帧模式：驱动已在收到字节时解析 "+IPD,<len>:"，本函数只从"数据缓冲"
+ *         取 <len> 个载荷字节，**不会**把 AT 应答文本混进来。
+ * @retval 实际读到的字节数；0 表示超时没数据
+ */
+uint16_t esp_at_read_data(uint8_t *dst, uint16_t max_len, uint32_t timeout_ms);
 
 /** @brief 直接把裸字节写到串口（不做任何 AT 封装） */
 void esp_at_write(const uint8_t *data, uint16_t len);

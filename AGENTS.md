@@ -4,32 +4,39 @@
 
 人和 AI 的分工：**业务代码要写得人能看懂（`examples/`、`library/esp_net.h` 里的注释就是说明书）；维护规则要写得 AI 能执行（就是本文件）。**
 
+配套文档：**原理 / 移植 / FAQ / 潜在问题** → `docs/INTERNALS.md`；**改动历史** → `docs/CHANGELOG.md`；**给用户看的 1 分钟速览** → `README.md`。本文件只管「什么能动 / 不能动 / 怎么验证」。
+
 ---
 
 ## 1. 认知地图
 
 ```
-用户业务任务 ──调 API──> library/esp_net.h ──> library/esp_net.c ──> esp8266_at / mqtt_client
-                                                    │
+用户业务任务 ──调 API──> library/esp_net.h ──> library/esp_net.c ──调 esp_proto_t 表──> esp_proto_mqtt.c ──> mqtt_client
+                                                    │   （协议实现只认识 esp_stream_t 的 write/read，不认识 ESP8266）
+                                                    ├──> esp8266_at（建链：AT 指令 / 透传 / 分帧）
                                                     └──调函数指针──> library/esp_port.h ──> port/*.c ──> 某平台的 HAL
 ```
 
 | 文件 | 职责 | 能不能改 |
 |---|---|---|
-| `library/esp_net.h` | **唯一对外头文件**，7 个 API + 回调类型 | 加 API 才算改这里，动签名是破坏性变更 |
+| `library/esp_net.h` | **唯一对外头文件**，8 个 API + 回调类型 | 加 API 才算改这里，动签名是破坏性变更 |
 | `library/esp_net_config.h` | **唯一配置入口**（WiFi/broker/主题/缓冲/超时/日志） | 只加宏，**不要**删或改宏名（用户会依赖） |
-| `library/esp_net.c` | 编排：建链时序、在线循环、断线自愈、上行队列、下行命令分发 | 核心，改动前先读 §3 的不变量 |
-| `library/esp8266_at.[ch]` | 内部：AT 指令驱动 + 自持环形缓冲 | 内部实现，**不要**把它暴露进 `esp_net.h` |
+| `library/esp_net.c` | 编排：建链时序、在线循环、断线自愈、上行队列、下行命令分发 | 核心，改动前先读 §3 的不变量；**只调 `esp_proto_t` 表，禁止直接调 `mqtt_*`** |
+| `library/esp_proto.h` | 协议接口（vtable）+ `esp_stream_t` 字节流抽象 | 「换协议栈」的唯一接口点；改它要同步改所有协议实现 |
+| `library/esp_proto_mqtt.[ch]` | 协议实现：MQTT 3.1.1（默认，包住 `mqtt_client`） | 只认识 `esp_stream_t`，**不得** include `esp8266_at.h`，也不得被暴露进 `esp_net.h` |
+| `library/esp8266_at.[ch]` | 内部：AT 指令驱动 + 环形缓冲；分帧模式在此解析 `+IPD,<len>:`（AT 文本与 TCP 载荷分两条缓冲） | 内部实现，**不要**把它暴露进 `esp_net.h` |
 | `library/mqtt_client.[ch]` | 内部：MQTT 3.1.1 报文编解码 | 同上 |
 | `library/esp_port.h` | 移植层接口（5 个函数指针） | 加字段要同步改所有 `port/*.c` |
-| `port/esp_port_stm32f1.[ch]` | STM32F1 移植实现 | 平台相关，勿把平台代码混进 `library/` |
+| `port/esp_port_stm32f1.[ch]` | STM32F1 移植实现（**`USART2_IRQHandler` 在这里**） | 平台相关，勿把平台代码混进 `library/` |
+| `docs/INTERNALS.md` | 原理 / 移植 / FAQ / 潜在问题（给想深入的人） | 随代码更新 |
+| `docs/CHANGELOG.md` | 改动历史（改了什么 / 为什么 / 验证 / 内存） | **每次实质改动追加一条** |
 | `examples/stm32f103c8t6/` | 可跑 demo（CubeMX 骨架 + `demo_app.c` + `freertos.c`） | 业务示例，随便改 |
 | `examples/.../Makefile` | 构建主体（CubeMX「Makefile」工具链的形状） | 可由 CubeMX 重新生成覆盖 |
 | `examples/.../Makefile.user` | **我们自加的源文件与包含路径 + 头文件依赖** | 新增 `.c` / `-I` 写这里；末尾三处不可删（见 §3 #11），不受 CubeMX 影响 |
 | `examples/.../cubemx-fix.ps1` | CubeMX 重新生成后的自动修补（`build.cmd` 会调） | 靠锚点行 `vpath %.c` 定位，改锚点前先确认 CubeMX 模板没变 |
 
-**数据流（上行）**：业务任务 → `esp_net_publish()` 拷贝入队 → `net_pump_pub_queue()` 在联网任务里取出 → `mqtt_publish()` → `net_transport_write()` → `esp_at_send()` → 串口 → ESP8266。
-**数据流（下行）**：串口 IDLE 中断 → `esp_net_input()` → `esp8266_at` 的环形缓冲 → `esp_at_ring_take()` 里跑 `esp_at_watch_byte()`（掉线检测）→ `mqtt_poll()` 解包 → `net_on_publish()` → 先改变量表，再转用户回调。
+**数据流（上行）**：业务任务 → `esp_net_publish()` 拷贝入队 → `net_pump_pub_queue()` 在联网任务里取出 → `s_proto->publish()`（默认 `esp_proto_mqtt.c`）→ `net_transport_write()` → `esp_at_send()` → 串口 → ESP8266。
+**数据流（下行）**：串口 IDLE 中断 → `esp_net_input()` → `esp8266_at` 的环形缓冲（分帧模式先经 `at_ipd_feed()` 把 `+IPD` 载荷分流到数据缓冲）→ `esp_at_ring_take()` 里跑 `esp_at_watch_byte()`（掉线检测）→ `s_proto->poll()` 解包（默认 MQTT，走 `esp_at_read_data()`）→ `net_on_publish()` → 先改变量表，再转用户回调。
 
 ---
 
@@ -69,7 +76,8 @@ $code | D:\Python\python.exe -
 
 本机测试环境：EMQX 在 `D:\emqx-5.0.8-windows-amd64`（`bin\emqx.cmd start|stop`），Windows 移动热点网关 `192.168.137.1`，MQTT 客户端可用 MQTTX 或 python paho。
 
-> 编译产物的内存基线：**Debug FLASH 37896 B / RAM 14728 B**，Release FLASH 25892 B / RAM 14720 B。RAM 已到 71.9%，**新增缓冲/任务前先算内存**。
+> 编译产物的内存基线：**Debug FLASH 39444 B / RAM 15312 B**（74.77%）。RAM 已到 ~75%，**新增缓冲/任务前先算内存**。
+> （历史：初始 37896/14728 → P1 协议解耦 38544/14776 → 分帧修复 39444/15312，详见 `docs/CHANGELOG.md`。）
 
 ---
 
@@ -88,6 +96,7 @@ $code | D:\Python\python.exe -
 | 9 | **调 OpenOCD 用相对路径** | OpenOCD 对含中文的绝对路径处理不好 |
 | 10 | **`Core/` 里只有 `USER CODE BEGIN/END` 段内的代码是安全的** | 其余部分被 CubeMX 重新生成时覆盖；PA8 配置、`printf` 重定向、任务创建都在 USER CODE 段里 |
 | 11 | **`Makefile.user` 末尾三处不可删**：`%.o: CFLAGS += -MMD -MP`、`.DEFAULT_GOAL := all`、`-include $(wildcard $(BUILD_DIR)/*.d)` | ① 不加 `-MMD`：改 `.h`（最常改的 `esp_net_config.h`）不触发重编，会静默烧进旧固件；② 不设 `.DEFAULT_GOAL`：`Makefile.user` 在 `all:` 之前被 include，`.d` 里第一条规则会抢走默认目标，`mingw32-make` 从此不再执行 `all`（只打印某 `.o` is up to date）；③ 不 include `.d`：前两条都白做 |
+| 12 | **发 AT 指令只准用 `at_flush_rx()`，禁止用 `esp_at_flush()`**（`esp8266_at.c`）；`esp_at_flush()` 只留给重建链路（复位 / 退透传 / init） | 分帧模式下 `esp_at_flush()` 会连 TCP 载荷缓冲和拆包状态一起清。发送要等 `>`，等待期间到达的下行数据已在数据缓冲里，被清掉 = 静默丢下行。`at_flush_rx()` 只清 AT 文本缓冲，保持上行握手与下行接收隔离 |
 
 ---
 
@@ -106,6 +115,10 @@ $code | D:\Python\python.exe -
 **移植到新平台**
 1. 新建 `port/esp_port_<平台>.c`，实现 `esp_port_t` 的 5 个函数；2. 在串口接收中断里调 `esp_net_input()`；3. **不要**改 `library/` 的任何文件。
 
+**换 / 加一个协议栈（例如将来加 HTTP）**
+1. 新建 `library/esp_proto_<协议>.c`，实现一份 `esp_proto_t`（照抄 `esp_proto_mqtt.c` 的形状）；2. 协议里**只准**用 `esp_stream_t` 的 `write` / `read`，不要 include `esp8266_at.h`；3. 加进 `Makefile.user` 的 `C_SOURCES`；4. 使用方在 `esp_net_init()` **之前**调 `esp_net_set_proto(&esp_proto_<协议>)`；5. `library/esp_net.c` **一行都不用改**（它只调这张表）。
+> 返回值约定见 `esp_proto.h`：`<0` 一律当链路错误（触发重连），`publish` 的 `>0` 表示报文问题（丢该条、不断链）。
+
 **改 MQTT 主题 / 服务器**
 只改 `library/esp_net_config.h`。上行主题由业务在 `esp_net_publish()` 时指定（demo 里是 `demo_config.h` 的 `DEMO_TOPIC_PUB`）。
 
@@ -119,6 +132,8 @@ $code | D:\Python\python.exe -
 - ❌ 用 `HAL_UART_Receive()` 轮询接收与 DMA 共存 —— 会 `HAL_BUSY`，且曾与 DMA 接收冲突（历史 bug，已删除该路径）。
 - ❌ 用 `AT+MQTTCONN` —— 板载 AT 固件是 **v1.2.0.0（2016-07）**，根本没有这条命令。MQTT 必须是本库自己拼的 3.1.1 报文。
 - ❌ 把 `esp8266_at.h` / `mqtt_client.h` include 进 `esp_net.h` —— 内部实现不得泄漏到公开头文件。
+- ❌ 在 `esp_net.c` 里直接调 `mqtt_*`（或任何具体协议） —— 协议必须走 `esp_proto_t` 表（默认 `esp_proto_mqtt.c`），否则 HTTP / 别的协议插不进来。
+- ❌ 让协议实现 include `esp8266_at.h` —— 协议只认 `esp_stream_t` 的 write/read，碰了 AT 指令就和 ESP8266 绑死，换硬件（W5500 / 4G / 裸 socket）就废了。
 - ❌ 在中断里调 `printf` —— newlib 的 stdio 不可重入。
 - ❌ 提交 `build/` 目录 —— 已在 `.gitignore` 里，别 `git add -f`。
 - ❌ 为了「顺手清理」删掉 `library/` 里的模式判断、超时兜底、队列保留逻辑 —— 每一条都是针对实测故障加的（对应 §3 的 #4、§2 的判据 4）。

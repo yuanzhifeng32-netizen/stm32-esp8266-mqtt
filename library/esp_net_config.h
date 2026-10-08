@@ -5,8 +5,10 @@
  * ---------------------------------------------------------------------------
  * 分层（照这个边界读代码就不会乱）
  * ---------------------------------------------------------------------------
- *   library/esp_net.h         ← 「用户唯一的头文件」：7 个 API + 回调类型
- *   library/esp_net.c         ← 「联网编排」：连 WiFi→TCP→MQTT、断线自愈、命令分发
+ *   library/esp_net.h         ← 「用户唯一的头文件」：8 个 API + 回调类型
+ *   library/esp_net.c         ← 「联网编排」：连 WiFi→TCP、断线自愈、命令分发（不认识具体协议）
+ *   library/esp_proto.h       ← 「协议接口」：换协议栈（MQTT / 将来 HTTP）的接口点
+ *   library/esp_proto_mqtt.[ch] ← 「协议实现」：默认的 MQTT 3.1.1
  *   library/esp8266_at.[ch]   ← 「内部」：ESP8266 AT 指令驱动（不对外暴露）
  *   library/mqtt_client.[ch]  ← 「内部」：MQTT 3.1.1 报文编解码（不对外暴露）
  *   library/esp_port.h        ← 「移植层」：库与硬件之间唯一的边界
@@ -72,6 +74,14 @@
    建议 >= MQTT_RX_BUFFER_SIZE + 一帧的长度，512 B 足够。 */
 #define ESP_NET_RX_BUFFER_SIZE      512U
 
+/* 【仅分帧模式使用】TCP 载荷专用环形缓冲。
+   分帧模式下串口上混着两种数据：AT 应答文本（"OK" / ">" / "SEND OK"）和
+   TCP 数据（"+IPD,<len>:" 后面跟 <len> 个字节）。驱动会在收到字节时就把两者
+   拆开：AT 文本进 ESP_NET_RX_BUFFER_SIZE 那条，TCP 载荷进这一条。
+   物理隔离的意义：库发上行时"等 > 提示符"不会把同时到达的下行数据吞掉。
+   透传模式不使用本缓冲（那时串口上只有裸 TCP 字节流）。 */
+#define ESP_AT_DATA_BUFFER_SIZE     512U
+
 /* 用户调用 esp_net_publish() 时，消息先进这个发送队列，由联网任务排队发出去。
    这样任何任务/中断都能安全发布，不需要加锁。 */
 #define ESP_NET_PUB_QUEUE_LEN       4U
@@ -92,7 +102,7 @@
    多一层握手、慢，但每一步都能在串口上看见，适合排查问题。 */
 #define ESP_LINK_MODE_FRAME         0
 
-#define ESP_LINK_MODE               ESP_LINK_MODE_TRANSPARENT
+#define ESP_LINK_MODE               ESP_LINK_MODE_FRAME
 
 /* ==========================================================================
  * 5. 超时 / 时序

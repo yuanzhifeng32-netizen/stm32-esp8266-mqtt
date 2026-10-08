@@ -5,10 +5,13 @@
  * 状态流（任何一步失败都回到起点重来）：
  *
  *   [上电] → 等模块回 OK → ATE0 → CWMODE=1 → CWJAP 连 WiFi
- *          → CIPMUX=0 → CIPCLOSE(清残留) → CIPSTART 连 broker
+ *          → CIPMUX=0 → CIPCLOSE(清残留) → CIPSTART 连服务器
  *          → (透传模式) CIPMODE=1 + CIPSEND 进透传
- *          → MQTT CONNECT / CONNACK → SUBSCRIBE / SUBACK
- *          → 在线循环：收下行 + 发上行队列 + PINGREQ 保活
+ *          → 交给协议实现建链（默认 MQTT：CONNECT / CONNACK → SUBSCRIBE / SUBACK）
+ *          → 在线循环：收下行 + 发上行队列 + 保活
+ *
+ * 本文件**不认识**具体协议：建链与在线循环都只调 esp_proto_t 这张函数表
+ * （默认实现见 esp_proto_mqtt.c），所以换协议栈不必改这里。
  *
  * 首发协议栈：MIT
  */
@@ -16,7 +19,8 @@
 #include "esp_net.h"
 #include "esp_net_config.h"
 #include "esp8266_at.h"
-#include "mqtt_client.h"
+#include "esp_proto.h"
+#include "esp_proto_mqtt.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -26,14 +30,19 @@
 /* 移植层回调（esp_net_init 时绑定） */
 static const esp_port_t *s_port;
 
-/* MQTT 收发缓冲。放静态区而不是栈上：一个任务栈只有 2 KB，塞不下几百字节的报文 */
-static uint8_t s_mqttTxBuffer[ESP_MQTT_TX_BUFFER_SIZE];
-static uint8_t s_mqttRxBuffer[ESP_MQTT_RX_BUFFER_SIZE];
+/* 当前协议实现（默认 MQTT，可用 esp_net_set_proto 覆盖）与它自己的上下文 */
+static const esp_proto_t *s_proto;
+static void              *s_protoCtx;
 
-static mqtt_client_t    s_mqtt;
-static mqtt_transport_t s_transport;
+/* 协议收发缓冲。放静态区而不是栈上：一个任务栈只有 2 KB，塞不下几百字节的报文。
+   长度由 esp_net_config.h 的 ESP_MQTT_*_BUFFER_SIZE 决定（宏名沿用，勿改）。 */
+static uint8_t s_protoTxBuffer[ESP_MQTT_TX_BUFFER_SIZE];
+static uint8_t s_protoRxBuffer[ESP_MQTT_RX_BUFFER_SIZE];
 
-/* 是否已连上 broker */
+/* 建链参数：esp_net_init() 里从 esp_net_config.h 的宏组装一次，之后交给协议实现 */
+static esp_proto_cfg_t s_cfg;
+
+/* 是否已连上服务器 */
 static volatile uint8_t s_online;
 
 /* 用户注册的下行消息回调 */
@@ -41,7 +50,7 @@ static esp_net_msg_cb_t s_userCb;
 
 /* ---- 上行发送队列 --------------------------------------------------------
    esp_net_publish() 只是把消息拷进这个队列（很快，任何任务都能调），
-   真正发出去由联网任务在线循环里做，避免两个任务同时碰 mqtt_client。 */
+   真正发出去由联网任务在线循环里做，避免两个任务同时碰协议实现。 */
 typedef struct
 {
     char     topic[ESP_NET_PUB_TOPIC_MAX];
@@ -81,7 +90,7 @@ static uint8_t       s_varCount;
 /* ------------------------------------------------------------ 传输层适配 */
 
 /* 这两个函数就是整套代码"可移植"的接口点：
-   MQTT 客户端只认识这两根函数指针，换成 W5500/4G 模组时只需重写它们。 */
+   协议实现（默认 MQTT）只认识这根字节流，换成 W5500/4G 模组时只需重写它们。 */
 
 static int net_transport_write(const uint8_t *data, uint16_t len)
 {
@@ -94,10 +103,18 @@ static int net_transport_write(const uint8_t *data, uint16_t len)
 
 static int net_transport_read(uint8_t *data, uint16_t max_len, uint32_t timeout_ms)
 {
-    /* 透传模式下对端关 TCP 时模块会吐 "CLOSED"，这个检测已经在 esp8266_at 驱动里
-       用逐字节状态机做好了（跨 read 分片也不会漏），上层用 esp_at_link_closed() 查。 */
-    return (int)esp_at_read(data, max_len, timeout_ms);
+    /* 用 esp_at_read_data()：两种链路模式下它都只返回 **TCP 载荷**。
+       分帧模式下 AT 应答文本（"OK" / ">" / +IPD 头）已被驱动分流走，
+       不会混进协议层的字节流里。 */
+    return (int)esp_at_read_data(data, max_len, timeout_ms);
 }
+
+/* 交给协议实现的字节流：它只认这两个函数，不认识 ESP8266 / AT 指令 */
+static const esp_stream_t s_stream =
+{
+    net_transport_write,
+    net_transport_read,
+};
 
 /* ------------------------------------------------------------ 下行命令处理 */
 
@@ -253,7 +270,7 @@ static void net_apply_commands(const uint8_t *payload, uint16_t payload_len)
 }
 
 /**
- * @brief  收到下行 PUBLISH 的回调（由 mqtt_poll 在联网任务里同步调用）。
+ * @brief  收到下行 PUBLISH 的回调（由协议 poll 在联网任务里同步调用）。
  *         先处理命令主题，再把原始消息转给用户回调。
  */
 static void net_on_publish(const char *topic, uint16_t topic_len,
@@ -416,8 +433,8 @@ static esp_err_t net_open_tcp(void)
     /* 透传模式的 AT+CIPMODE=1 交给 esp_at_enter_transparent() 统一设置 */
 
     (void)snprintf(cmd, sizeof(cmd), "AT+CIPSTART=\"TCP\",\"%s\",%u",
-                   ESP_MQTT_HOST, (unsigned)ESP_MQTT_PORT);
-    ESP_LOG("[net] tcp -> %s:%u\r\n", ESP_MQTT_HOST, (unsigned)ESP_MQTT_PORT);
+                   s_cfg.host, (unsigned)s_cfg.port);
+    ESP_LOG("[net] tcp -> %s:%u\r\n", s_cfg.host, (unsigned)s_cfg.port);
 
     NET_CHECK(esp_at_cmd(cmd, "CONNECT", ESP_TCP_CONNECT_TIMEOUT_MS));
     ESP_LOG("[net] tcp connected\r\n");
@@ -430,33 +447,6 @@ static esp_err_t net_open_tcp(void)
     return ESP_OK;
 }
 
-/** @brief MQTT CONNECT + SUBSCRIBE */
-static mqtt_status_t net_mqtt_start(void)
-{
-    const char   *user = (ESP_MQTT_USERNAME[0] != '\0') ? ESP_MQTT_USERNAME : NULL;
-    const char   *pass = (ESP_MQTT_PASSWORD[0] != '\0') ? ESP_MQTT_PASSWORD : NULL;
-    mqtt_status_t st;
-
-    st = mqtt_connect(&s_mqtt, ESP_MQTT_CLIENT_ID, user, pass,
-                      NULL, NULL, ESP_MQTT_KEEPALIVE_S);
-    if (st != MQTT_OK)
-    {
-        ESP_LOG("[net] mqtt CONNECT failed, status %d\r\n", (int)st);
-        return st;
-    }
-    ESP_LOG("[net] mqtt CONNACK ok (client id: %s)\r\n", ESP_MQTT_CLIENT_ID);
-
-    st = mqtt_subscribe(&s_mqtt, ESP_NET_TOPIC_CMD, 0U);
-    if (st != MQTT_OK)
-    {
-        ESP_LOG("[net] mqtt SUBSCRIBE failed, status %d\r\n", (int)st);
-        return st;
-    }
-    ESP_LOG("[net] mqtt subscribed: %s\r\n", ESP_NET_TOPIC_CMD);
-
-    return MQTT_OK;
-}
-
 /**
  * @brief  建链流程（掉线后重连也走这里）；0 = 成功
  *
@@ -465,12 +455,12 @@ static mqtt_status_t net_mqtt_start(void)
  *   ② 诊断 WiFi 还在不在
  *        在 → 只重开 TCP（快，~2 s）
  *        不在 → 重连 WiFi 再开 TCP（慢，~10 s）
- *   ③ 重开 TCP + MQTT CONNECT/SUBSCRIBE
+ *   ③ 重开 TCP → 进透传 → 交给协议实现建链（默认 MQTT：CONNECT / SUBSCRIBE）
  */
 static int net_link_up(void)
 {
     s_online = 0U;
-    mqtt_client_reset(&s_mqtt);
+    s_proto->reset(s_protoCtx);
     esp_at_clear_link_closed();
 
     /* ① 回到 AT 指令模式：先退透传，再探活；卡死才硬复位 */
@@ -494,14 +484,14 @@ static int net_link_up(void)
         }
     }
 
-    /* ③ 重开 TCP → 进透传 → MQTT */
+    /* ③ 重开 TCP → 进透传 → 协议建链 */
     if (net_open_tcp() != ESP_OK)
     {
         return -1;
     }
-    if (net_mqtt_start() != MQTT_OK)
+    if (s_proto->connect(s_protoCtx, &s_cfg) != 0)
     {
-        /* MQTT 没起来，但模块此时还停在透传里（TCP 是活的，只是 broker 不理）。
+        /* 协议没起来，但模块此时还停在透传里（TCP 是活的，只是服务器不理）。
            先 "+++" 退出来，下一轮才能直接发 AT 做诊断；否则状态一直是"透传中"，
            每轮都得先退一次透传，日志上就是反复的 "+++"。 */
         if (esp_at_is_transparent() != 0U)
@@ -525,10 +515,11 @@ static int net_pump_pub_queue(void)
     while (s_pubHead != s_pubTail)
     {
         esp_net_pub_msg_t *m = &s_pubQueue[s_pubHead];
-        mqtt_status_t      st;
+        int                st;
 
-        st = mqtt_publish(&s_mqtt, m->topic, m->payload, m->payload_len, m->qos, m->retain);
-        if (st == MQTT_OK)
+        st = s_proto->publish(s_protoCtx, m->topic, m->payload, m->payload_len,
+                              m->qos, m->retain);
+        if (st == 0)
         {
             ESP_LOG("[net] up %s -> %.*s\r\n", m->topic, (int)m->payload_len,
                     (const char *)m->payload);
@@ -536,13 +527,13 @@ static int net_pump_pub_queue(void)
             continue;
         }
 
-        if ((st == MQTT_ERR_TRANSPORT) || (st == MQTT_ERR_TIMEOUT))
+        if (st < 0)
         {
             return -1;   /* 链路问题：留着这条，重连后再发 */
         }
 
-        /* 报文本身有问题（超缓冲等）：丢掉，免得卡住队列 */
-        ESP_LOG("[net] drop queued pub (%s), status %d\r\n", m->topic, (int)st);
+        /* 协议报"报文本身有问题"（>0，如超缓冲）：丢掉，免得卡住队列 */
+        ESP_LOG("[net] drop queued pub (%s), status %d\r\n", m->topic, st);
         s_pubHead = (uint8_t)((s_pubHead + 1U) % ESP_NET_PUB_QUEUE_LEN);
     }
     return 0;
@@ -558,18 +549,16 @@ static void net_online_loop(void)
 
     for (;;)
     {
-        mqtt_message_t msg;
-
-        /* ---- 1) 收下行数据（等 50 ms，有就立刻处理）---- */
+        /* ---- 1) 收下行数据（最多等 recv_timeout_ms，有就立刻处理）---- */
         {
-            int r = mqtt_poll(&s_mqtt, &msg, 50U);
+            int r = s_proto->poll(s_protoCtx, s_cfg.recv_timeout_ms);
 
             if (r < 0)
             {
                 ESP_LOG("\r\n[net] transport error -> reconnect\r\n");
                 break;
             }
-            /* r > 0 的 PUBLISH 已由 net_on_publish() 回调就地处理 */
+            /* r > 0 的业务消息已由 net_on_publish() 回调就地处理 */
         }
 
         /* ---- 2) 对端把 TCP 关了（驱动逐字节匹配到 "CLOSED"）---- */
@@ -594,7 +583,7 @@ static void net_online_loop(void)
             if ((now - lastPing) >= ESP_MQTT_PING_PERIOD_MS)
             {
                 lastPing = now;
-                if (mqtt_ping(&s_mqtt) != MQTT_OK)
+                if (s_proto->ping(s_protoCtx) != 0)
                 {
                     ESP_LOG("\r\n[net] keepalive timeout -> reconnect\r\n");
                     break;
@@ -611,6 +600,14 @@ static void net_online_loop(void)
 
 /* ---------------------------------------------------------------- 公开函数 */
 
+void esp_net_set_proto(const esp_proto_t *proto)
+{
+    if (proto != NULL)
+    {
+        s_proto = proto;
+    }
+}
+
 void esp_net_init(const esp_port_t *port)
 {
     s_port = port;
@@ -618,21 +615,35 @@ void esp_net_init(const esp_port_t *port)
     /* 启动串口接收（DMA 循环 + 空闲中断喂数据） */
     esp_at_init(port);
 
-    s_transport.write = net_transport_write;
-    s_transport.read  = net_transport_read;
+    /* 没显式换过协议就用默认的 MQTT */
+    if (s_proto == NULL)
+    {
+        s_proto = &esp_proto_mqtt;
+    }
 
-    mqtt_client_init(&s_mqtt, &s_transport,
-                     s_mqttTxBuffer, (uint16_t)sizeof(s_mqttTxBuffer),
-                     s_mqttRxBuffer, (uint16_t)sizeof(s_mqttRxBuffer));
+    /* 建链参数：从配置宏组装一次，之后协议实现只认这个结构体（不必认识那些宏） */
+    s_cfg.host            = ESP_MQTT_HOST;
+    s_cfg.port            = (uint16_t)ESP_MQTT_PORT;
+    s_cfg.client_id       = ESP_MQTT_CLIENT_ID;
+    s_cfg.user            = (ESP_MQTT_USERNAME[0] != '\0') ? ESP_MQTT_USERNAME : NULL;
+    s_cfg.pass            = (ESP_MQTT_PASSWORD[0] != '\0') ? ESP_MQTT_PASSWORD : NULL;
+    s_cfg.sub_topic       = ESP_NET_TOPIC_CMD;
+    s_cfg.keepalive_s     = (uint16_t)ESP_MQTT_KEEPALIVE_S;
+    s_cfg.ping_period_ms  = ESP_MQTT_PING_PERIOD_MS;
+    s_cfg.recv_timeout_ms = 50U;   /* 在线循环单次 poll 的阻塞上限（与改前一致） */
 
-    /* 收到 PUBLISH 就进 net_on_publish()：命令主题 → 改变量；再转给用户回调 */
-    mqtt_set_publish_callback(&s_mqtt, net_on_publish);
+    /* 把它自己的收发缓冲与字节流交给协议实现；
+       下行消息统一进 net_on_publish()：命令主题 → 改变量，再转给用户回调。 */
+    (void)s_proto->init(&s_protoCtx, &s_stream,
+                        s_protoTxBuffer, (uint16_t)sizeof(s_protoTxBuffer),
+                        s_protoRxBuffer, (uint16_t)sizeof(s_protoRxBuffer),
+                        net_on_publish);
 
     s_pubHead = 0U;
     s_pubTail = 0U;
     s_online  = 0U;
 
-    ESP_LOG("[net] esp_net_init done\r\n");
+    ESP_LOG("[net] esp_net_init done (proto: %s)\r\n", s_proto->name);
 }
 
 void esp_net_input(const uint8_t *data, uint16_t len)
@@ -716,9 +727,9 @@ void esp_net_task(void *argument)
         {
             net_online_loop();
 
-            /* 走到这里说明链路已断（TCP 都死了）。此时还在透传模式，往串口写 MQTT
-               DISCONNECT 只会被丢进已死的 TCP，没有任何意义；重连时 mqtt_client_reset()
-               会把客户端状态清干净。所以这里什么都不发，直接进下一轮。 */
+            /* 走到这里说明链路已断（TCP 都死了）。此时还在透传模式，往串口写协议的
+               DISCONNECT 只会被丢进已死的 TCP，没有任何意义；重连时 s_proto->reset()
+               会把协议状态清干净。所以这里什么都不发，直接进下一轮。 */
         }
         else
         {

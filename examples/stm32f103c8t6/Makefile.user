@@ -12,11 +12,12 @@
 ##############################################################################
 
 # 框架本体 + 移植层 + demo 业务
-#   ../../library  = 平台无关的联网框架（esp_net / esp8266_at / mqtt_client）
+#   ../../library  = 平台无关的联网框架（esp_net / esp_proto_mqtt / esp8266_at / mqtt_client）
 #   ../../port     = STM32F1 移植层（USART2 DMA 循环 + IDLE 中断 + PA8 复位）
 C_SOURCES += \
 ../../library/esp8266_at.c \
 ../../library/mqtt_client.c \
+../../library/esp_proto_mqtt.c \
 ../../library/esp_net.c \
 ../../port/esp_port_stm32f1.c \
 Core/Src/demo_app.c
