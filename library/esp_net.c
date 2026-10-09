@@ -22,6 +22,8 @@
 #include "esp_proto.h"
 #include "esp_proto_mqtt.h"
 #include "esp_ws.h"
+#include "esp_cred.h"
+#include "esp_prov.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -45,6 +47,20 @@ static esp_proto_cfg_t s_cfg;
 
 /* 是否已连上服务器 */
 static volatile uint8_t s_online;
+
+/* 当前生效的 WiFi 账号密码：启动时优先取"配网存下来的凭据"，没有才用配置宏 */
+static char s_wifiSsid[ESP_PROV_SSID_MAX];
+static char s_wifiPass[ESP_PROV_PASS_MAX];
+
+/* 配网请求标志：PB6 触发 / 上层调用 esp_net_request_config() 置位，
+   联网任务在循环里发现后转入配网模式。volatile：会被别的任务写。 */
+#if ESP_PROV_ENABLE
+static volatile uint8_t s_configReq;
+/* 是否正在配网（供业务点灯 / 状态显示查询，见 esp_net_is_configuring） */
+static volatile uint8_t s_inProv;
+/* Flash 里是否存过 WiFi 凭据：开机自检用，无凭据且开了 ESP_PROV_AUTO_BOOT 就自动进配网 */
+static uint8_t          s_credOk;
+#endif
 
 /* 用户注册的下行消息回调 */
 static esp_net_msg_cb_t s_userCb;
@@ -276,6 +292,67 @@ static void net_apply_commands(const uint8_t *payload, uint16_t payload_len)
 }
 
 /**
+ * @brief  云端配网：载荷 = "WiFi名,密码"（分隔符也可以是 ; 空格 换行）。
+ *         写进凭据存储后立即重启，用新 WiFi 连网。
+ */
+static void net_apply_wifi_command(const uint8_t *payload, uint16_t len)
+{
+    char     ssid[ESP_PROV_SSID_MAX];
+    char     pass[ESP_PROV_PASS_MAX];
+    uint16_t sep = len;
+    uint16_t i;
+
+    /* 找第一个分隔符，前面是 SSID，后面是密码 */
+    for (i = 0U; i < len; i++)
+    {
+        if ((payload[i] == ',') || (payload[i] == ';') ||
+            (payload[i] == ' ') || (payload[i] == '\n') || (payload[i] == '\r'))
+        {
+            sep = i;
+            break;
+        }
+    }
+
+    {
+        uint16_t sl = (sep < (uint16_t)(sizeof(ssid) - 1U)) ? sep : (uint16_t)(sizeof(ssid) - 1U);
+        uint16_t pstart = (uint16_t)((sep < len) ? (sep + 1U) : len);
+        uint16_t pl = (uint16_t)(len - pstart);
+
+        memcpy(ssid, payload, sl);
+        ssid[sl] = '\0';
+        if (pl > (uint16_t)(sizeof(pass) - 1U)) { pl = (uint16_t)(sizeof(pass) - 1U); }
+        memcpy(pass, payload + pstart, pl);
+        pass[pl] = '\0';
+    }
+
+    if (ssid[0] == '\0')
+    {
+        ESP_LOG("[net] wifi cmd: empty ssid, ignore\r\n");
+        return;
+    }
+
+    ESP_LOG("[net] wifi cmd: ssid=\"%s\"\r\n", ssid);
+    if (esp_cred_save(ssid, pass) != 0)
+    {
+        ESP_LOG("[net] wifi cmd: save failed\r\n");
+        return;
+    }
+
+    (void)snprintf(s_wifiSsid, sizeof(s_wifiSsid), "%s", ssid);
+    (void)snprintf(s_wifiPass, sizeof(s_wifiPass), "%s", pass);
+
+    ESP_LOG("[net] wifi saved, rebooting...\r\n");
+    if ((s_port != NULL) && (s_port->system_reset != NULL))
+    {
+        s_port->system_reset();
+    }
+    else
+    {
+        ESP_LOG("[net] no system_reset in port, reboot manually\r\n");
+    }
+}
+
+/**
  * @brief  收到下行 PUBLISH 的回调（由协议 poll 在联网任务里同步调用）。
  *         先处理命令主题，再把原始消息转给用户回调。
  */
@@ -290,6 +367,14 @@ static void net_on_publish(const char *topic, uint16_t topic_len,
         (memcmp(topic, ESP_NET_TOPIC_CMD, topic_len) == 0))
     {
         net_apply_commands(payload, payload_len);
+    }
+
+    /* 配网主题：payload = "WiFi名,密码"，写凭据并立即重启 */
+    if ((topic_len == (uint16_t)strlen(ESP_NET_TOPIC_WIFI)) &&
+        (memcmp(topic, ESP_NET_TOPIC_WIFI, topic_len) == 0))
+    {
+        net_apply_wifi_command(payload, payload_len);
+        return;   /* 控制类消息，不再转给用户回调 */
     }
 
     /* 用户回调：拿到原始 topic / payload 做自己的业务 */
@@ -375,8 +460,8 @@ static esp_err_t net_join_wifi(void)
     NET_CHECK(esp_at_cmd("AT+CWMODE=1", NULL, ESP_AT_CMD_TIMEOUT_MS)); /* 1 = Station */
 
     (void)snprintf(cmd, sizeof(cmd), "AT+CWJAP=\"%s\",\"%s\"",
-                   ESP_WIFI_SSID, ESP_WIFI_PASSWORD);
-    ESP_LOG("[net] joining wifi \"%s\" ...\r\n", ESP_WIFI_SSID);
+                   s_wifiSsid, s_wifiPass);
+    ESP_LOG("[net] joining wifi \"%s\" ...\r\n", s_wifiSsid);
 
     err = esp_at_cmd(cmd, "OK", ESP_WIFI_JOIN_TIMEOUT_MS);
     if (err != ESP_OK)
@@ -572,6 +657,15 @@ static void net_online_loop(void)
 
     for (;;)
     {
+#if ESP_PROV_ENABLE
+        /* ---- 0) 收到配网请求（PB6 长按）→ 跳出在线循环去配网 ---- */
+        if (s_configReq != 0U)
+        {
+            ESP_LOG("\r\n[net] config requested -> leave online\r\n");
+            break;
+        }
+#endif
+
         /* ---- 1) 收下行数据（最多等 recv_timeout_ms，有就立刻处理）---- */
         {
             int r = s_proto->poll(s_protoCtx, s_cfg.recv_timeout_ms);
@@ -684,6 +778,35 @@ void esp_net_init(const esp_port_t *port)
     s_pubTail = 0U;
     s_online  = 0U;
 
+    /* WiFi 账号密码：优先用"配网存下来的凭据"，没有就回退到配置宏。
+       这样用户改了 WiFi 也不用重新烧固件。 */
+    {
+        esp_cred_t cred;
+
+        if (esp_cred_load(&cred) == 0)
+        {
+            (void)snprintf(s_wifiSsid, sizeof(s_wifiSsid), "%s", cred.ssid);
+            (void)snprintf(s_wifiPass, sizeof(s_wifiPass), "%s", cred.pass);
+            ESP_LOG("[net] wifi from flash: \"%s\"\r\n", s_wifiSsid);
+#if ESP_PROV_ENABLE
+            s_credOk = 1U;
+#endif
+        }
+        else
+        {
+            (void)snprintf(s_wifiSsid, sizeof(s_wifiSsid), "%s", ESP_WIFI_SSID);
+            (void)snprintf(s_wifiPass, sizeof(s_wifiPass), "%s", ESP_WIFI_PASSWORD);
+            ESP_LOG("[net] wifi from config: \"%s\"\r\n", s_wifiSsid);
+#if ESP_PROV_ENABLE
+            s_credOk = 0U;
+#endif
+        }
+    }
+#if ESP_PROV_ENABLE
+    s_configReq = 0U;
+    s_inProv    = 0U;
+#endif
+
     ESP_LOG("[net] esp_net_init done (proto: %s)\r\n", s_proto->name);
 }
 
@@ -758,12 +881,106 @@ uint8_t esp_net_is_online(void)
     return s_online;
 }
 
+uint8_t esp_net_is_configuring(void)
+{
+#if ESP_PROV_ENABLE
+    return s_inProv;
+#else
+    return 0U;
+#endif
+}
+
+void esp_net_request_config(void)
+{
+#if ESP_PROV_ENABLE
+    s_configReq = 1U;
+#else
+    ESP_LOG("[net] provisioning disabled (ESP_PROV_ENABLE=0)\r\n");
+#endif
+}
+
+int esp_net_wifi_set(const char *ssid, const char *pass)
+{
+    if ((ssid == NULL) || (ssid[0] == '\0'))
+    {
+        return -1;
+    }
+    if (pass == NULL)
+    {
+        pass = "";
+    }
+    return esp_cred_save(ssid, pass);
+}
+
+void esp_net_reboot(void)
+{
+    if ((s_port != NULL) && (s_port->system_reset != NULL))
+    {
+        s_port->system_reset();
+    }
+}
+
 void esp_net_task(void *argument)
 {
     (void)argument;
 
+#if (ESP_PROV_ENABLE && ESP_PROV_AUTO_BOOT)
+    static uint8_t s_bootProvDone;   /* 开机自检只做一次 */
+#endif
+
     for (;;)
     {
+#if ESP_PROV_ENABLE
+#if ESP_PROV_AUTO_BOOT
+        /* ---- 开机自检（只做一次）：Flash 里从没存过 WiFi 凭据 -> 直接进配网，
+                不再尝试硬编码 WiFi。配过网就正常联网。 ---- */
+        if (s_bootProvDone == 0U)
+        {
+            s_bootProvDone = 1U;
+            if ((s_credOk == 0U) && (s_configReq == 0U))
+            {
+                ESP_LOG("[net] no saved wifi credentials -> auto provisioning\r\n");
+                s_configReq = 1U;
+            }
+        }
+#endif
+        /* ---- 配网优先：一旦有请求（PB6 长按 / 上层调用），暂停联网去开热点配网 ---- */
+        if (s_configReq != 0U)
+        {
+            s_configReq = 0U;
+
+            /* 配网要发 AT 指令，先退出透传（透传里发 AT 没人理） */
+            if (esp_at_is_transparent() != 0U)
+            {
+                (void)esp_at_exit_transparent();
+            }
+
+            ESP_LOG("\r\n[net] entering provisioning mode\r\n");
+            s_inProv = 1U;   /* 业务任务据此让 PC13 闪烁（见 esp_net_is_configuring） */
+
+            /* esp_prov_run 内部会开 SoftAP + 迷你网页，阻塞在这里直到配网完成或超时。
+               返回 0 = 用户提交了新的 WiFi 并已写入 Flash。 */
+            if (esp_prov_run() == 0)
+            {
+                ESP_LOG("[net] wifi configured, rebooting...\r\n");
+                if ((s_port != NULL) && (s_port->system_reset != NULL))
+                {
+                    s_port->system_reset();
+                }
+                else
+                {
+                    ESP_LOG("[net] no system_reset in port, reboot manually\r\n");
+                }
+            }
+            else
+            {
+                ESP_LOG("[net] provisioning exit (timeout/fail)\r\n");
+            }
+            s_inProv = 0U;
+            continue;
+        }
+#endif
+
         if (net_link_up() == 0)
         {
             net_online_loop();

@@ -20,8 +20,10 @@ C_SOURCES += \
 ../../library/esp_proto_mqtt.c \
 ../../library/esp_http.c \
 ../../library/esp_ws.c \
+../../library/esp_prov.c \
 ../../library/esp_net.c \
 ../../port/esp_port_stm32f1.c \
+../../port/esp_cred_stm32f1.c \
 Core/Src/demo_app.c
 
 C_INCLUDES += \

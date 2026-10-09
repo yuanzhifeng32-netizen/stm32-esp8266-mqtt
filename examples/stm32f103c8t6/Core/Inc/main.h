@@ -66,6 +66,21 @@ void Error_Handler(void);
 #define ESP_EN_GPIO_Port        GPIOA
 /* 上电时先把 PA8 拉低这么久，给 ESP8266 一个干净的复位/上电沿，再拉高使能 */
 #define ESP_EN_RESET_LOW_MS     300U
+
+/* ---- WiFi 配网按键：PB6 ----
+   上拉输入，按下 = 低电平。两种触发方式（见 freertos.c / demo_app.c）：
+     ① 上电时已按住 → 开机直接进配网；
+     ② 运行中按住不放满 ESP_PROV_HOLD_MS → 进配网。 */
+#define WIFI_CFG_Pin            GPIO_PIN_6
+#define WIFI_CFG_GPIO_Port      GPIOB
+
+/* ---- 状态指示灯：PC13 ----
+   Blue Pill 板载 LED 接在 PC13，**低电平点亮**（灌电流）。配网模式期间闪烁提示，
+   运行时熄灭（拉高）。 */
+#define STATUS_LED_Pin          GPIO_PIN_13
+#define STATUS_LED_GPIO_Port    GPIOC
+#define STATUS_LED_ON()         HAL_GPIO_WritePin(STATUS_LED_GPIO_Port, STATUS_LED_Pin, GPIO_PIN_RESET)
+#define STATUS_LED_OFF()        HAL_GPIO_WritePin(STATUS_LED_GPIO_Port, STATUS_LED_Pin, GPIO_PIN_SET)
 /* USER CODE END Private defines */
 
 #ifdef __cplusplus

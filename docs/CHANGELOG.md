@@ -5,6 +5,107 @@
 
 ---
 
+## 2026-10-09 — 默认公网服务器 + PC13 配网灯 + 无凭据开机自动配网
+
+**目标**：让设备"开箱即用"——默认直接连公网云服务器，没配过网就自动进配网（LED 提示），配好 WiFi 后走公网。
+
+**改动**：
+
+- `library/esp_net_config.h`
+  - `ESP_MQTT_HOST` 由局域网 IP 改为**默认公网隧道** `"ko4rl4997501.vicp.fun"`（本机 EMQX 的 ws 口 8083 经 HTTP 隧道映射到公网 80）；`ESP_WS_PORT` `8083 → 80`。想走本地只改 host / 端口两行，`ESP_MQTT_PORT`(1883) 保留给裸 TCP 直连。
+  - 新增 `ESP_PROV_AUTO_BOOT`（默认 1）：Flash 没存过凭据时开机自动进配网。
+- `library/esp_net.[ch]`
+  - `esp_net_init()` 记下 `s_credOk`（Flash 是否命中凭据）。
+  - `esp_net_task()` 首轮自检：无凭据且 `ESP_PROV_AUTO_BOOT` 开 → 自动置 `s_configReq` 进配网。
+  - 进入/退出配网维护 `s_inProv`；**新增第 12 个 API `esp_net_is_configuring()`** 供业务查状态点灯。
+- `examples/.../Core/Inc/main.h` + `Core/Src/gpio.c`：新增 **PC13 状态灯**（Blue Pill 板载 LED，低电平点亮），默认熄灭。
+- `examples/.../Core/Src/demo_app.c`：主循环 100 ms 一拍，配网期间翻转 PC13（闪烁），退出配网熄灭；横幅 broker 行按传输方式打印。
+- 精简：核对 `esp_net_config.h` 全部宏，确认均有引用，**未删任何宏**（遵守"只加不删"约定）。
+
+**内存**：FLASH 55760 → **56152 B (85.68%)**，RAM 不变 **18096 B (88.36%)**，编译零 `-Wall` 警告。
+
+**验证**：全量重编零警告；`mingw32-make flash` → `** Verified OK **`。⚠️ 板端端到端待复测（默认连公网隧道 / 无凭据进配网 / PC13 闪烁）。
+
+---
+
+## 2026-10-09 — 修复：配网"保存并重启"（改为直接扫描表单正文，绕开 HTTP 分帧）
+
+**问题**：上一版加了旁路回调后，`[prov rx]` 里仍只能看到 POST 的 **body**（`ssid=…&pass=…`），看不到含 `+IPD,<id>,<len>:POST /save` 的请求头，设备依然不重启。
+
+**决断**：历次日志反复证明——**表单正文 `ssid=..&pass=..` 每次都稳定到达**（它在请求最末尾），只有前缀（请求行 + 多数请求头 + `+IPD` 帧头）会在发 AT 命令等应答时被吃掉。与其继续死磕 `+IPD` / HTTP 分帧，不如**直接在原始字节流里找表单字段**。
+
+**修复**：
+
+- `library/esp_prov.c`：新增 `prov_scan_byte()` 凭据扫描器——逐字节匹配 `ssid=` / `pass=` / `end=1` 三个标记，命中即取字段值（含 URL 解码 `%XX`、`+`→空格），三标记到齐即置 `s_scanReady`。凡进入 `prov_feed_byte()` 的字节（主动读 + 旁路回调两条路）都会过一遍扫描器。主循环检测到 `s_scanReady` 就**直接 `esp_cred_save()` 并 break**，对本路径完全**不依赖 +IPD / 跨帧 / link id**。
+- 表单新增隐藏字段 `<input type="hidden" name="end" value="1">` 作结束哨兵（放在 pass 之后；否则最后一个字段没有终止符，不知何时收尾）。
+- 原 HTTP 解析路径保留，二者互不影响：完整请求能拼齐时走原路，拼不齐时扫描器兜底。
+
+**内存**：新增扫描缓冲 `s_scanSsid[33]` + `s_scanPass[65]` 等约 112 B。FLASH 54852 → **55760 B (85.08%)**，RAM 17984 → **18096 B (88.36%)**，编译零 `-Wall` 警告。
+
+**验证**：⚠️ 板端待复跑。期望：点"保存并重启" → `[prov] saved ssid="…" (via scan)` → `[prov] credentials saved, reboot to apply` → 重启后用新 WiFi 联网。
+
+**注意**：RAM 已到 **88.4%**（20 KB 只剩 ~2.4 KB），新增缓冲前务必先算内存。
+
+---
+
+## 2026-10-09 — 修复：配网页"保存并重启"没反应（AT 应答读取吃掉 HTTP 请求）
+
+**问题**：手机连上 `STM32-Setup` 热点后网页能开、`GET /` 与 `GET /scan` 都正常，但点"保存并重启"无任何反应——不重启。串口 `[prov rx …]` 里能看到 POST 的 **body**（`ssid=…&pass=…`），却看不到请求头，也没有 `[prov] req(…) link N: POST /save` 这行。
+
+**根因**：配网用 raw 接收，上网数据（`+IPD,<id>,<len>:…`）和 AT 应答**共用同一条接收环** `s_rxRing`。而发 AT 命令要走应答读取这条路径：
+
+1. `esp_at_cmd()` 开头的 `at_flush_rx()` 会**直接清空**接收环；
+2. `esp_at_expect()` 一路读环匹配 `OK` / `>` / `SEND OK`，**把期间到达的字节当噪声丢弃**。
+
+配网发响应（`AT+CIPSEND` 等 `>` / 等 `SEND OK` / `AT+CIPCLOSE`）以及 `AT+CWLAP` 扫描期间，浏览器发来的**下一个请求**正好落在这条路径上，整段头被吃掉，只剩尾巴留在环里被后续解析看到。解析器因此永远匹配不到 `+IPD,`，`POST /save` 丢失 → 不保存、不重启。放大缓冲、把累计长度静态化都治不了这个（那是之前两轮的误判）。
+
+**修复**：
+
+- `library/esp8266_at.[ch]`：新增 `esp_at_set_raw_sink(fn)` 旁路回调。raw 模式下，**凡是被 AT 应答路径吃掉的字节**（`at_flush_rx()` 清环前、`esp_at_expect()` 读到的每一段）都先喂给该回调，而不是丢弃。
+- `library/esp_prov.c`：把 `+IPD,<id>,<len>:` 解析抽成 `prov_feed_byte()`，**同时被两条路喂入**——① 主动读（`prov_pump`，`esp_at_read`）；② AT 应答旁路（回调）。两条路共享同一状态机，所以"发响应的同时到达的下一个请求"也能完整拼出来；用 `s_reqReady` 标志交给主循环，处理完上一请求再取走。
+
+**第二处根因（上一版补丁引入的回归，已修）**：为"已凑齐的请求别被新字节覆盖"在 `prov_feed_byte()` 开头加了 `if (s_reqReady) return;` 守卫。但这个守卫**把新请求整帧丢掉**：发 `/scan` 响应期间，浏览器常先发 favicon / 重复 `/scan`，它一凑齐就把 `s_reqReady` 置 1；紧接着真正的 `POST /save` 帧到达，被守卫直接丢弃 → 只剩尾巴、永不重启。修法：**去掉守卫**，改成在 `PS_LEN` 匹配到 `:` 进入 `PS_DATA` 时判断——若上一个请求已 ready，则**新帧优先**（清 `s_reqLen`/`s_reqReady` 从头拼这个新请求）；只有"未拼完且 link 相同"的半包才保留跨帧续拼。
+
+**顺带**：删除 `prov_close()` 及其在三个 handler 里的全部调用——响应头已带 `Connection: close`，多余的 `AT+CIPCLOSE` 只增加一段"等应答"窗口，反而更容易吃掉下一个请求。
+
+其余加固保留：`s_req` 512 → **1024 B**；累计长度/当前 link id 静态化（跨帧拼包）；请求拼装期间刷新静默计时；`GET /scan` 的 JSON 补 `; charset=utf-8`；配网横幅 `CONFIG MODE (reqbuf 1024B)`。
+
+**内存**：本修复**不需要额外缓冲**（旁路回调直接复用 `s_req`）。FLASH 54736 → **54852 B (83.70%)**（删掉 `prov_close` 后回落 ~96 B），RAM 17976 → **17984 B (87.81%)**，编译零 `-Wall` 警告。
+
+**验证**：⚠️ 板端待复跑。期望：`[prov] req(NNN) link N: POST /save …` → `[prov] saved ssid="…"` → `[prov] credentials saved, reboot to apply` → 重启后用新 WiFi 联网。
+
+**注意**：RAM 已到 **87.8%**（20 KB 只剩 ~2.5 KB），新增缓冲前务必先算内存。
+
+**关于中文乱码**：串口日志里的 `灏忕背yu7` 是**串口终端按 GBK 解码 UTF-8 字节**的显示假象（`灏忕背` 正是 `小米` 的 UTF-8 字节被 GBK 解读的结果），模块透传、浏览器提交、`prov_form_get` 解码、Flash 存储全程都是 UTF-8，功能上没坏；只需在浏览器端确认中文 SSID 显示正常。
+
+---
+
+## 2026-10-09 — WiFi 配网（本地按键 + 云端下发，凭据存 Flash）
+
+**目标**：设备换 WiFi / 首次部署时不必改代码重烧固件。两条路：① 本地按键触发开热点 + 微型网页配网；② 云端发 MQTT 消息远程下发 WiFi。
+
+**新增文件**：
+
+- `library/esp_cred.h` + `port/esp_cred_stm32f1.c` —— WiFi 凭据持久化（接口在库、实现在 port）。STM32F1 用 `HAL_FLASH` 存**最后一页** `0x0800FC00`（1 KB，F103C8T6 是 64 KB 芯片，第 63 页），布局 `magic + ssid_len + pass_len + cksum + ssid[33] + pass[65]`，写后读回 `strcmp` 校验。
+- `library/esp_prov.[ch]` —— 本地配网核心：`AT+CWMODE=3` + `AT+CWSAP` 开 SoftAP → `AT+CIPMUX=1` + `AT+CIPSERVER=1,80` 开 TCP 服务 → 自己解析 `+IPD,<id>,<len>:` → 极简 HTTP 路由：`GET /`（网页）、`GET /scan`（`AT+CWLAP` 结果转 JSON）、`POST /save`（写凭据）。网页含 JS `fetch('/scan')` 自动扫描下拉。
+
+**改动**：
+
+- `library/esp_port.h` + `port/esp_port_stm32f1.c` —— `esp_port_t` 新增 `system_reset` 函数指针（配网保存后重启生效；实现为 `NVIC_SystemReset()`）。
+- `library/esp8266_at.[ch]` —— 新增 `esp_at_set_raw_rx(on)`（旁路 `+IPD` 分流，把字节全交 AT 文本环给 esp_prov 自己解析）与 `esp_at_now_ms()`。
+- `library/esp_net_config.h` —— 新增第 7 节配网宏：`ESP_PROV_ENABLE` / `ESP_PROV_AP_SSID`(STM32-Setup) / `ESP_PROV_AP_PASSWORD`(12345678) / `ESP_PROV_AP_CHANNEL` / `ESP_PROV_HTTP_PORT` / `ESP_PROV_HOLD_MS` / `ESP_PROV_TIMEOUT_MS` / `ESP_PROV_SCAN_TIMEOUT_MS` / `ESP_PROV_SSID_MAX` / `ESP_PROV_PASS_MAX` / `ESP_CRED_FLASH_PAGE` / `ESP_NET_TOPIC_WIFI`。**只加宏，未删改旧宏。**
+- `library/esp_net.[ch]` —— 启动时优先读 Flash 凭据决定 WiFi（读不到回退配置宏）；`net_on_publish` 处理 `stm32/wifi` 主题（`ssid,pass` → 存 Flash → 重启）；联网任务循环顶部检查配网请求并调 `esp_prov_run()`；新增 3 个 API `esp_net_request_config()` / `esp_net_wifi_set()` / `esp_net_reboot()`（8 → 11 个）。
+- `examples/.../Core/Inc/main.h` + `Core/Src/gpio.c` —— PB6 上拉输入（配网按键）。
+- `examples/.../Core/Src/freertos.c` —— `esp_net_init()` 后检测 PB6：上电时已按住则直接进配网（放在 init 之后，避免被 init 里的标志清零覆盖）。
+- `examples/.../Core/Src/demo_app.c` —— 主循环改 100 ms 一拍，轮询 PB6 连续按住满 `ESP_PROV_HOLD_MS` 触发配网。
+- `Makefile.user` —— 加入 `esp_prov.c` / `esp_cred_stm32f1.c`。
+
+**验证**：编译零 `-Wall` 警告。FLASH 44604 → **54156 B (82.64%)**，RAM 15632 → **17456 B (85.23%)**（+1.8 KB，主要是配网静态缓冲 `s_req[512]` / 扫描 `resp[512]` / `json[640]`）。⚠️ **硬件端到端未验证**：需实测 AT 固件 v1.2.0.0 的 `AT+CWSAP` / `AT+CWLAP` / `AT+CIPSEND=<id>,<len>` 行为，以及 `CWMODE=3` 下扫描是否受限（回退：先 `CWMODE=1` 扫描再 `CWMODE=3` 开热点）。
+
+**注意**：RAM 已到 **85%**，新增缓冲/任务前必须先算内存。
+
+---
+
 ## 2026-10-08 — 修复：WebSocket 握手缺 `Sec-WebSocket-Protocol` 被 broker 拒绝
 
 **问题**：默认（WEBSOCKET）模式连不上，日志停在 `[net] websocket handshake failed`。

@@ -15,6 +15,7 @@
 7. [常见修改配方](#7-常见修改配方)
 8. [FAQ](#8-faq)
 9. [已知限制 / 潜在问题](#9-已知限制--潜在问题)
+10. [WiFi 配网实现](#10-wifi-配网实现)
 
 ---
 
@@ -43,7 +44,7 @@
 
 | 文件 | 职责 | 改它的规矩 |
 |---|---|---|
-| `library/esp_net.h` | **唯一对外头文件**：8 个 API + 回调类型 | 只加 API；动签名 = 破坏性变更 |
+| `library/esp_net.h` | **唯一对外头文件**：12 个 API + 回调类型 | 只加 API；动签名 = 破坏性变更 |
 | `library/esp_net_config.h` | **唯一配置入口**：WiFi / broker / 主题 / 缓冲 / 超时 / 日志 | 只加宏，不改宏名（用户会依赖） |
 | `library/esp_net.c` | 编排：建链时序、在线循环、断线自愈、上行队列、下行分发 | 只准调 `esp_proto_t` 表，禁止直接调 `mqtt_*` |
 | `library/esp_proto.h` | 协议 vtable（`esp_proto_t`）+ `esp_stream_t` 字节流抽象 | 「换协议栈」的唯一接口点 |
@@ -52,7 +53,7 @@
 | `library/esp_ws.[ch]` | 内部：WebSocket 客户端（HTTP Upgrade 握手 + 帧封/拆），**在 `esp_stream_t` 外再包一层** | 内部实现，不暴露进 `esp_net.h` |
 | `library/esp8266_at.[ch]` | 内部：AT 指令驱动 + 环形缓冲 + 分帧拆包 | 内部实现，不暴露进 `esp_net.h` |
 | `library/mqtt_client.[ch]` | 内部：MQTT 3.1.1 报文编解码 | 同上 |
-| `library/esp_port.h` | 移植层接口（5 个函数指针） | 加字段要同步改所有 `port/*.c` |
+| `library/esp_port.h` | 移植层接口（6 个函数指针） | 加字段要同步改所有 `port/*.c` |
 | `port/esp_port_stm32f1.[ch]` | STM32F1 移植实现 | 平台相关，勿混进 `library/` |
 
 **分层铁律**：`library/` 里不出现任何 HAL / 具体 RTOS 调用。所以换 STM32F4 / GD32 / 裸机都只改 `port/`。
@@ -173,7 +174,8 @@ esp_net.c ─> esp_ws_stream() ─(帧封/拆)─> 底层 esp_stream_t(TCP) ─>
 
 ```c
 #define ESP_MQTT_TRANSPORT           ESP_MQTT_TRANSPORT_WEBSOCKET  /* 默认；改 ESP_MQTT_TRANSPORT_TCP 可直连 1883 */
-#define ESP_WS_PORT                  8083U     /* EMQX ws 默认端口 */
+#define ESP_MQTT_HOST                "ko4rl4997501.vicp.fun"  /* 默认云服务器；本地直连改回局域网 IP */
+#define ESP_WS_PORT                  80U       /* 公网隧道 80 → 本机 EMQX ws 8083；本地直连改回 8083 */
 #define ESP_WS_PATH                  "/mqtt"   /* EMQX ws 默认路径 */
 ```
 
@@ -215,6 +217,8 @@ esp_net.c ─> esp_ws_stream() ─(帧封/拆)─> 底层 esp_stream_t(TCP) ─>
 | `ESP_NET_PUB_QUEUE_LEN` × 单条 | 4 × (32+128) | 上行发布队列 |
 | `ESP_WS_TX_BUFFER_SIZE` | 320 B | **仅 WebSocket**：发帧时给载荷做掩码的临时区 |
 | `ESP_WS_RX_BUFFER_SIZE` | 512 B | **仅 WebSocket**：拆帧后攒的载荷（握手响应也复用这条） |
+| `esp_prov.c` 的 `s_req[1024]` / `resp[512]` / `json[640]` / 凭据扫描器 ~112 B | ~2288 B | **仅配网**：HTTP 请求暂存 / `AT+CWLAP` 应答 / 扫描 JSON / 表单字段扫描 |
+| `s_wifiSsid[33]` + `s_wifiPass[65]` | 98 B | 当前生效的 WiFi 账号密码（凭据或配置宏） |
 
 编译产物基线（Debug）。**注意链路模式与传输方式都会影响数字**，比对时先看列：
 
@@ -225,8 +229,10 @@ esp_net.c ─> esp_ws_stream() ─(帧封/拆)─> 底层 esp_stream_t(TCP) ─>
 | + 分帧接收修复（含 512 B 数据缓冲） | 分帧 | TCP | 39444 B | 15312 B (74.77%) |
 | + MQTT over WebSocket | 透传 | TCP | 38752 B | 14792 B (72.23%) |
 | + MQTT over WebSocket | 透传 | WEBSOCKET（默认） | 44572 B | 15632 B (76.33%) |
+| + WiFi 配网（本地 + 云端） | 透传 | WEBSOCKET（默认） | 54156 B | 17456 B (85.23%) |
+| + 默认云服务器 / 配网扫描器 / PC13 配网灯 / 无凭据自动配网 | 透传 | WEBSOCKET（默认） | 56152 B | 18096 B (88.36%) |
 
-> RAM 已到 ~75%，**新增缓冲 / 任务前先算内存**。TCP 传输下 WS 的代码与缓冲会被 `--gc-sections` 丢弃，所以开不开 WS 代码对 TCP 模式几乎无影响；只有 `ESP_MQTT_TRANSPORT = WEBSOCKET` 时才真正多占那 ~840 B。
+> RAM 已到 ~88%，**新增缓冲 / 任务前先算内存**。TCP 传输下 WS 的代码与缓冲会被 `--gc-sections` 丢弃，所以开不开 WS 代码对 TCP 模式几乎无影响；只有 `ESP_MQTT_TRANSPORT = WEBSOCKET` 时才真正多占那 ~840 B。
 
 ---
 
@@ -251,7 +257,7 @@ esp_net.c ─> esp_ws_stream() ─(帧封/拆)─> 底层 esp_stream_t(TCP) ─>
 
 **在别的协议里复用 HTTP 客户端**：`esp_http.[ch]` 的 `esp_http_build()` / `esp_http_recv()` / `esp_http_status()` / `esp_http_header()` 是通用的，可以拿来做 REST（发 GET/POST 上报）。
 
-**移植到新平台**：新建 `port/esp_port_<平台>.c` 实现 `esp_port_t` 的 5 个函数 → 在串口接收处调 `esp_net_input()`（见 §3）→ **不改 `library/` 任何文件**。
+**移植到新平台**：新建 `port/esp_port_<平台>.c` 实现 `esp_port_t` 的 6 个函数 → 在串口接收处调 `esp_net_input()`（见 §3）→ **不改 `library/` 任何文件**。配网用到 Flash 时，还要实现 `esp_cred.h` 的 `load/save/erase`（参考 `port/esp_cred_stm32f1.c`）。
 
 ---
 
@@ -281,9 +287,40 @@ A：全程零 `malloc`，缓冲大小都在 `esp_net_config.h`；任务用 `Stat
 
 - **`ESP_LINK_MODE` 是编译期二选一**，没有运行期自动切换。分帧修复后两种模式代码都在，但**最近一次硬件回归只覆盖了分帧模式**，透传模式是等价替换（编译通过）后未重跑硬件。
 - **MQTT over WebSocket（`ESP_MQTT_TRANSPORT`）只做了编译验证，未做硬件端到端**。用前需确认 EMQX 的 ws 监听已开（默认 8083 / 路径 `/mqtt`）。只支持明文 `ws://`，不支持 `wss://`。
+- **默认服务器是公网隧道** `ko4rl4997501.vicp.fun`（HTTP 透传，公网 80 → 本机 EMQX ws 8083）。隧道是**单向 HTTP 透传**，设备侧走的就是标准 `ws://` 握手，无需特殊处理；若隧道本身不稳定/重启，设备会按 `ESP_NET_RETRY_MS` 重连。想走局域网直连只改 `ESP_MQTT_HOST` + `ESP_WS_PORT`。
 - **WebSocket 单帧上限 = `ESP_WS_RX_BUFFER_SIZE`（512 B）**：服务器发来超过这个长度的单帧会被判错并触发重连。正常 MQTT（尤其本库 TX/RX 缓冲都 ≤ 256 B）不会碰到；若将来要收大包，调大它。
 - **分帧模式下行缓冲 `ESP_AT_DATA_BUFFER_SIZE` 满时丢新字节**。若下行突发流量大，调大它。
 - **环形缓冲是单生产者单消费者**。若你想从多个任务同时调 `esp_net_input()`，需要自己加锁——正常用法（只有中断喂数据）不需要。
 - **`esp_at_expect()` 的应答累积缓冲 512 B**（`ESP_AT_RESP_BUFFER_SIZE`），超长应答会被截断，仅影响解析，不影响数据通路。
 - **构建系统**：`Makefile` + `Makefile.user` + `cubemx-fix.ps1` 三件套。CubeMX 重新生成会覆盖 `Makefile` 和链接脚本，跑 `build.cmd` 会自动修补（细节见 [examples/stm32f103c8t6/README.md](../examples/stm32f103c8t6/README.md) 与 [AGENTS.md](../AGENTS.md) §3 #11）。
 - **工具链是 GCC 5.2.1（很老）**：链接脚本里的 `(READONLY)` 已删、`-mthumb` 写在 `Makefile` 的 `MCU` 里；CubeMX 重新生成后由 `cubemx-fix.ps1` 自动补回。
+- **WiFi 配网只做了编译验证，未做硬件端到端**：板载 AT 固件 v1.2.0.0 的 `AT+CWSAP` / `AT+CWLAP` / `AT+CIPSEND=<id>,<len>` 行为、以及 `CWMODE=3` 下能否扫描，都待实测（回退方案见 §10）。
+- **凭据存在 Flash 最后一页 `0x0800FC00`**：配网写入会**整页擦除**。若将来把常量表 / 数据也放到那一页，会被擦掉（当前链接脚本未使用该页，安全）。
+
+---
+
+## 10. WiFi 配网实现
+
+**目的**：换 WiFi / 首次部署不必重烧固件。两条路共用一份 Flash 凭据。
+
+**本地（按键 → 热点 → 网页）**，全部在 `library/esp_prov.c`：
+
+1. `esp_net_request_config()` 置标志 → 联网任务的循环顶部发现后**跳出在线循环**、退透传，调 `esp_prov_run()`。
+2. `AT+CWMODE=3`（AP+STA，扫描要 STA）→ `AT+CWSAP` 开 SoftAP（默认 `STM32-Setup`/`12345678`）→ `AT+CIPMUX=1` → `AT+CIPSERVER=1,80` 开 TCP 服务。
+3. **关键**：服务器模式收到的请求帧是 `+IPD,<id>,<len>:`（比普通分帧多一个 link id），驱动的分流器不认 → 先 `esp_at_set_raw_rx(1)` 关掉分流，字节全进 AT 文本环，`esp_prov_read_request()` 自己用状态机（`PS_SEEK→PS_ID→PS_LEN→PS_DATA`）解析。
+4. 极简 HTTP 路由：`GET /` → 配网页（含 JS `fetch('/scan')` 自动扫描下拉）；`GET /scan` → `AT+CWLAP` 结果转 JSON；`POST /save` → **逐字节凭据扫描器** `prov_scan_byte()` 直接从原始字节流匹配 `ssid=` / `pass=` / `end=1`（含 URL 解码），三标记到齐即取值写盘——绕开不可靠的 HTTP 请求头 / `+IPD` 分帧（请求前缀常在发 AT 命令等应答时被吃掉，只有表单正文稳定到达）。
+5. 成功写盘后返回 0 → 联网任务调 `s_port->system_reset()` 重启生效（移植层没接就提示手动重启）。
+6. 收尾：`AT+CIPSERVER=0` → `AT+CIPMUX=0` → `esp_at_set_raw_rx(0)`，恢复常态。
+7. **状态灯**：进入配网时 `esp_net.c` 置 `s_inProv = 1`，业务侧 `esp_net_is_configuring()` 查询后闪 PC13（demo 里 demo_app.c 100 ms 一拍翻转）。
+
+**云端（MQTT 下发）**，在 `library/esp_net.c`：`net_on_publish()` 匹配主题 `ESP_NET_TOPIC_WIFI`（`stm32/wifi`），载荷 `ssid,pass` → `esp_cred_save()` → 立即 `system_reset()`。
+
+**启动读取**：`esp_net_init()` 里先 `esp_cred_load()`，成功用凭据、失败回退 `ESP_WIFI_SSID/PASSWORD`，同时记下 `s_credOk`。
+
+**开机自动配网**：联网任务首轮自检——`s_credOk == 0`（Flash 从没存过凭据）且 `ESP_PROV_AUTO_BOOT = 1`（默认）时，自动置 `s_configReq` 进配网（省去"必须按按键"这一步）。配过一次网后就正常联网，不再自动进。
+
+**凭据存储**（`port/esp_cred_stm32f1.c`）：Flash 最后一页 `0x0800FC00`，布局 `magic('WIFI1') + ssid_len + pass_len + cksum + ssid[33] + pass[65]`；写流程 `HAL_FLASH_Unlock → 页擦除 → 逐半字编程 → Lock → 读回 strcmp 校验`。
+
+**回退方案（若 `CWMODE=3` 下 `AT+CWLAP` 不返回）**：扫描前 `AT+CWMODE=1`，扫完再 `AT+CWMODE=3` + `AT+CWSAP`。
+
+**触发（demo，非库）**：`main.h`/`gpio.c` 把 PB6 配成上拉输入；`freertos.c` 在 `esp_net_init()` 之后检测"上电时已按住"直接进配网（放在 init 之后，避免被 init 清零）；`demo_app.c` 主循环 100 ms 一拍轮询长按。

@@ -54,6 +54,13 @@ typedef struct
 
     /** @brief 单调递增的毫秒时基（如 HAL_GetTick / xTaskGetTickCount） */
     uint32_t (*tick_ms)(void);
+
+    /**
+     * @brief 复位整个 MCU（配网保存凭据后重启生效用）。
+     * @note  不接这根线时填 NULL，库会跳过"保存后自动重启"这一步
+     *        （改由用户自己重启设备）。参考实现：NVIC_SystemReset()。
+     */
+    void (*system_reset)(void);
 } esp_port_t;
 
 #ifdef __cplusplus

@@ -5,7 +5,7 @@
  * ---------------------------------------------------------------------------
  * 分层（照这个边界读代码就不会乱）
  * ---------------------------------------------------------------------------
- *   library/esp_net.h         ← 「用户唯一的头文件」：8 个 API + 回调类型
+ *   library/esp_net.h         ← 「用户唯一的头文件」：12 个 API + 回调类型
  *   library/esp_net.c         ← 「联网编排」：连 WiFi→TCP、断线自愈、命令分发（不认识具体协议）
  *   library/esp_proto.h       ← 「协议接口」：换协议栈（MQTT / 将来 HTTP）的接口点
  *   library/esp_proto_mqtt.[ch] ← 「协议实现」：默认的 MQTT 3.1.1
@@ -37,9 +37,13 @@
 #define ESP_WIFI_JOIN_TIMEOUT_MS    20000U
 
 /* ==========================================================================
- * 2. MQTT 服务器（本机 EMQX 默认监听 1883）
+ * 2. MQTT 服务器
  * ========================================================================== */
-#define ESP_MQTT_HOST               "192.168.137.1"
+/* 默认走**公网**：本机 EMQX 的 WebSocket 口 8083 经 HTTP 隧道映射到公网 80，
+   设备开机即连它。想改回本地直连就改这里：
+     - 走 WebSocket（默认）：改第 2b 节的 ESP_WS_PORT，host 改回局域网 IP；
+     - 走裸 TCP            ：把 ESP_MQTT_TRANSPORT 改成 TCP，改下面的 ESP_MQTT_PORT。 */
+#define ESP_MQTT_HOST               "ko4rl4997501.vicp.fun"
 #define ESP_MQTT_PORT               1883U
 /* TCP 连接建立超时 */
 #define ESP_TCP_CONNECT_TIMEOUT_MS  10000U
@@ -76,9 +80,9 @@
 /* 默认走 MQTT over WebSocket（连 ws://8083）。想直连裸 TCP（1883）就改成 ESP_MQTT_TRANSPORT_TCP */
 #define ESP_MQTT_TRANSPORT           ESP_MQTT_TRANSPORT_WEBSOCKET
 
-/* WebSocket 端口与路径：EMQX 默认监听 8083，路径 /mqtt。
-   host 复用上面的 ESP_MQTT_HOST，这里只管端口和路径。 */
-#define ESP_WS_PORT                  8083U
+/* WebSocket 端口与路径。默认走公网：隧道把公网 80 映射到本机 EMQX 的 ws 口 8083，
+   所以这里端口填 80；本地直连 EMQX 时改回 8083。host 复用上面的 ESP_MQTT_HOST。 */
+#define ESP_WS_PORT                  80U
 #define ESP_WS_PATH                  "/mqtt"
 /* WebSocket 握手（HTTP Upgrade）超时 */
 #define ESP_WS_HANDSHAKE_TIMEOUT_MS  5000U
@@ -158,5 +162,45 @@
 #else
 #define ESP_LOG(...)                do { } while (0)
 #endif
+
+/* ==========================================================================
+ * 7. WiFi 配网（本地 PB6 SoftAP 网页 + 云端 MQTT 下发）
+ * ========================================================================== */
+/* 两条路都写同一份凭据（存 STM32 内部 Flash 最后一页），重启后生效：
+ *   本地：PB6 拉低 → ESP8266 开热点 + 迷你网页，手机填 WiFi 名/密码；
+ *   云端：往 ESP_NET_TOPIC_WIFI 发 "WiFi名,密码"。
+ * 没配过网时回退到第 1 节的 ESP_WIFI_SSID / ESP_WIFI_PASSWORD。 */
+
+/* 总开关：0 = 把配网相关代码整段编掉，只用第 1 节的硬编码 WiFi */
+#define ESP_PROV_ENABLE             1
+
+/* 开机自动配网：Flash 里**从没保存过** WiFi 凭据时，开机直接进配网（不再尝试硬编码 WiFi）；
+   配过网就正常联网。0 = 关闭（只靠长按 PB6 / 云端下发触发）。 */
+#define ESP_PROV_AUTO_BOOT          1
+
+/* 本地配网热点（SoftAP）：手机连上它，浏览器打开 http://192.168.4.1/ */
+#define ESP_PROV_AP_SSID            "STM32-Setup"
+#define ESP_PROV_AP_PASSWORD        "12345678"   /* 至少 8 位；留空 "" = 开放热点 */
+#define ESP_PROV_AP_CHANNEL         5U
+#define ESP_PROV_HTTP_PORT          80U
+
+/* 运行中长按 PB6 多久触发配网（ms）；上电时 PB6 为低则立即触发 */
+#define ESP_PROV_HOLD_MS            3000U
+/* 进入配网后，这么久没人操作就自动退出并恢复正常联网 */
+#define ESP_PROV_TIMEOUT_MS         300000U
+/* AT+CWLAP 扫描附近 WiFi 的超时 */
+#define ESP_PROV_SCAN_TIMEOUT_MS    15000U
+
+/* WiFi 名 / 密码长度上限（含结尾 '\0'） */
+#define ESP_PROV_SSID_MAX           33U
+#define ESP_PROV_PASS_MAX           65U
+
+/* 凭据存放的 Flash 页起始地址：STM32F103C8T6 共 64 KB，取最后 1 KB 的一页
+   （0x0800FC00 ~ 0x0800FFFF）。程序约 45 KB，够不着这一页。
+   注意别写成 0x0801FC00 —— 那是 128 KB 芯片的最后一页。 */
+#define ESP_CRED_FLASH_PAGE         0x0800FC00U
+
+/* 云端配网主题：往它发 "WiFi名,密码" 即写入凭据并立即重启生效 */
+#define ESP_NET_TOPIC_WIFI          "stm32/wifi"
 
 #endif /* ESP_NET_CONFIG_H */

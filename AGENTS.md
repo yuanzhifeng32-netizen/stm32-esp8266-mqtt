@@ -19,16 +19,19 @@
 
 | 文件 | 职责 | 能不能改 |
 |---|---|---|
-| `library/esp_net.h` | **唯一对外头文件**，8 个 API + 回调类型 | 加 API 才算改这里，动签名是破坏性变更 |
+| `library/esp_net.h` | **唯一对外头文件**，12 个 API + 回调类型 | 加 API 才算改这里，动签名是破坏性变更 |
 | `library/esp_net_config.h` | **唯一配置入口**（WiFi/broker/主题/传输方式/缓冲/超时/日志） | 只加宏，**不要**删或改宏名（用户会依赖） |
 | `library/esp_net.c` | 编排：建链时序、在线循环、断线自愈、上行队列、下行命令分发 | 核心，改动前先读 §3 的不变量；**只调 `esp_proto_t` 表，禁止直接调 `mqtt_*`** |
 | `library/esp_proto.h` | 协议接口（vtable）+ `esp_stream_t` 字节流抽象 | 「换协议栈」的唯一接口点；改它要同步改所有协议实现 |
 | `library/esp_proto_mqtt.[ch]` | 协议实现：MQTT 3.1.1（默认，包住 `mqtt_client`） | 只认识 `esp_stream_t`，**不得** include `esp8266_at.h`，也不得被暴露进 `esp_net.h` |
 | `library/esp_http.[ch]` | 内部：极简 HTTP/1.1 客户端（拼请求 / 收响应 / 解析状态码与头） | 内部实现，WebSocket 握手的地基；通用，可复用做 REST |
 | `library/esp_ws.[ch]` | 内部：WebSocket 客户端（HTTP Upgrade 握手 + 帧封/拆），**在 `esp_stream_t` 外再包一层** | 内部实现，**不得**暴露进 `esp_net.h`；不得 include `esp8266_at.h` |
+| `library/esp_prov.[ch]` | 内部：本地配网（SoftAP + `+IPD,<id>,<len>:` 自解析 + 极简 HTTP：`/` 网页 / `/scan` 扫描 / `/save` 存凭据） | 内部实现，**不得**暴露进 `esp_net.h`；靠 `esp_at_set_raw_rx(1)` 拿裸字节流 |
+| `library/esp_cred.h` | 内部：WiFi 凭据存取**接口**（`load/save/erase`），实现放 port | 库与硬件边界，实现必须放 `port/` |
+| `port/esp_cred_stm32f1.c` | STM32F1 凭据实现（`HAL_FLASH`，存**最后一页** `0x0800FC00`） | 平台相关；**不要**改页地址（F103C8T6 只有 64 KB） |
 | `library/esp8266_at.[ch]` | 内部：AT 指令驱动 + 环形缓冲；分帧模式在此解析 `+IPD,<len>:`（AT 文本与 TCP 载荷分两条缓冲） | 内部实现，**不要**把它暴露进 `esp_net.h` |
 | `library/mqtt_client.[ch]` | 内部：MQTT 3.1.1 报文编解码 | 同上 |
-| `library/esp_port.h` | 移植层接口（5 个函数指针） | 加字段要同步改所有 `port/*.c` |
+| `library/esp_port.h` | 移植层接口（6 个函数指针） | 加字段要同步改所有 `port/*.c` |
 | `port/esp_port_stm32f1.[ch]` | STM32F1 移植实现（**`USART2_IRQHandler` 在这里**） | 平台相关，勿把平台代码混进 `library/` |
 | `docs/INTERNALS.md` | 原理 / 移植 / FAQ / 潜在问题（给想深入的人） | 随代码更新 |
 | `docs/CHANGELOG.md` | 改动历史（改了什么 / 为什么 / 验证 / 内存） | **每次实质改动追加一条** |
@@ -78,8 +81,8 @@ $code | D:\Python\python.exe -
 
 本机测试环境：EMQX 在 `D:\emqx-5.0.8-windows-amd64`（`bin\emqx.cmd start|stop`），Windows 移动热点网关 `192.168.137.1`，MQTT 客户端可用 MQTTX 或 python paho。
 
-> 编译产物的内存基线：**Debug 默认配置（透传链路 + MQTT over WebSocket）：FLASH 44572 B / RAM 15632 B（76.33%）**；改 `ESP_MQTT_TRANSPORT = ESP_MQTT_TRANSPORT_TCP` 直连 1883 时为 **FLASH 38752 B / RAM 14792 B（72.23%）**。RAM 已到 ~76%，**新增缓冲/任务前先算内存**。
-> （历史：初始 37896/14728 → P1 协议解耦 38544/14776 → 分帧修复 39444/15312 → P2 MQTT over WebSocket 见上，详见 `docs/CHANGELOG.md`。）
+> 编译产物的内存基线：**Debug 默认配置（透传链路 + MQTT over WebSocket）：FLASH 56152 B（85.68%）/ RAM 18096 B（88.36%）**；改 `ESP_MQTT_TRANSPORT = ESP_MQTT_TRANSPORT_TCP` 直连 1883 时会更小。RAM 已到 ~88%，**新增缓冲/任务前先算内存**。
+> （历史：初始 37896/14728 → P1 协议解耦 38544/14776 → 分帧修复 39444/15312 → P2 MQTT over WebSocket 44572/15632 → P3 WiFi 配网 54156/17456 → P4 默认公网服务器 + 配网扫描器 + PC13 配网灯 56152/18096，详见 `docs/CHANGELOG.md`。）
 
 ---
 

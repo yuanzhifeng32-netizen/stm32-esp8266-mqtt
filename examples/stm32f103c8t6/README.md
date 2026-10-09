@@ -521,8 +521,9 @@ $SF = 'D:\twBlock\apm32f103\tools\stm32flash.exe'
   stm32103 | STM32F103C8T6 | ESP8266 + MQTT (demo)
   USART2 : PA2/PA3 115200 <--DMA ch6--> ESP8266
   USART1 : PA9/PA10 115200   debug log
-  broker : 192.168.137.1:1883   cmd topic: stm32/down
+  broker : ws://ko4rl4997501.vicp.fun:80/mqtt   cmd topic: stm32/down
   pub    : stm32/up   period: 10 s
+  wifi   : hold PB6 3000 ms or no creds -> provisioning (AP "STM32-Setup", PC13 blinks)
   build  : Oct  7 2026 ...   heap_free: ... B
 ============================================
 ...（连 WiFi / TCP / MQTT 的 AT 过程日志）...

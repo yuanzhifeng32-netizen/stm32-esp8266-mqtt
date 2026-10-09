@@ -111,6 +111,36 @@ int esp_net_var_register(const char *name, int32_t *value);
  */
 uint8_t esp_net_is_online(void);
 
+/**
+ * @brief  当前是否正处于配网模式（SoftAP 热点 + 配网页已开启）。
+ * @retval 1 = 正在配网；0 = 不在配网
+ * @note   配网在联网任务里阻塞执行，业务任务可据此做状态显示（例如让指示灯闪烁）。
+ *         ESP_PROV_ENABLE = 0 时恒为 0。
+ */
+uint8_t esp_net_is_configuring(void);
+
+/**
+ * @brief  请求进入 WiFi 配网模式（线程安全，置一个标志即可，随时可调）。
+ * @note   联网任务会在下一轮循环里发现该标志，暂停联网、开启配网热点
+ *         （默认 STM32-Setup / 12345678），手机连上后在网页里选 WiFi、填密码提交。
+ *         配网成功写入 Flash 后会重启，用新 WiFi 联网。
+ *         典型触发：PB6 按键长按 3 秒。需要 ESP_PROV_ENABLE = 1（默认）。
+ */
+void esp_net_request_config(void);
+
+/**
+ * @brief  直接写入 WiFi 账号密码到 Flash（下次重启生效），不入队、不重启。
+ * @param  ssid  WiFi 名（非空）；pass 密码，可为 NULL（= 无密码）
+ * @retval 0 = 已保存；-1 = 参数非法或 Flash 写入失败
+ * @note   一般不需要手动调：本地配网由配网页写入，云端配网由 stm32/wifi 主题写入。
+ */
+int esp_net_wifi_set(const char *ssid, const char *pass);
+
+/**
+ * @brief  立即复位重启（配网保存凭据后生效用）。移植层没实现 system_reset 时为空操作。
+ */
+void esp_net_reboot(void);
+
 #ifdef __cplusplus
 }
 #endif

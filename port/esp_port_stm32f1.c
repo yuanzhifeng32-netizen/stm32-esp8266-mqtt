@@ -96,8 +96,12 @@ static void port_init(void)
 /** @brief 把一段字节发给 ESP8266 */
 static void port_uart_write(const uint8_t *data, uint16_t len)
 {
-    /* 100 ms 超时而不是 HAL_MAX_DELAY：串口异常时不能把任务卡死 */
-    (void)HAL_UART_Transmit(&huart2, (uint8_t *)data, len, 100U);
+    /* 超时按字节数算，不能写死。115200 8N1 下 1 字节约 87 us，len/8 ms 足够、
+       再留 100 ms 余量。写死 100 ms 时，len > ~1140 会中途超时只发出一部分，
+       ESP8266 会一直等剩余字节，永远不回 SEND OK（配网页 1376 B 就是这样挂的）。 */
+    uint32_t timeout = ((uint32_t)len / 8U) + 100U;
+
+    (void)HAL_UART_Transmit(&huart2, (uint8_t *)data, len, timeout);
 }
 
 /** @brief 控制 PA8：1 = 使能（高），0 = 复位（低） */
@@ -119,13 +123,20 @@ static uint32_t port_tick_ms(void)
     return HAL_GetTick();
 }
 
+/** @brief 复位整个 MCU（配网/换网保存凭据后重启生效） */
+static void port_system_reset(void)
+{
+    NVIC_SystemReset();
+}
+
 /* 移植层实例：用户把这个地址传给 esp_net_init() */
 const esp_port_t esp_port_stm32f1 = {
     port_init,
     port_uart_write,
     port_reset_pin,
     port_delay_ms,
-    port_tick_ms
+    port_tick_ms,
+    port_system_reset
 };
 
 /* ---------------------------------------------------------------- 中断服务 */

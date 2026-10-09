@@ -45,6 +45,7 @@ void MX_GPIO_Init(void)
   /* GPIO Ports Clock Enable */
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
 
   /* USER CODE BEGIN ESP_EN */
   /* ---- ESP8266 使能脚 PA8：推挽输出，上电先拉低再拉高 ----
@@ -62,6 +63,20 @@ void MX_GPIO_Init(void)
   HAL_GPIO_WritePin(ESP_EN_GPIO_Port, ESP_EN_Pin, GPIO_PIN_RESET);
   HAL_Delay(ESP_EN_RESET_LOW_MS);
   HAL_GPIO_WritePin(ESP_EN_GPIO_Port, ESP_EN_Pin, GPIO_PIN_SET);
+
+  /* ---- WiFi 配网按键 PB6：上拉输入，按下读到低电平 ---- */
+  GPIO_InitStruct.Pin  = WIFI_CFG_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_PULLUP;
+  HAL_GPIO_Init(WIFI_CFG_GPIO_Port, &GPIO_InitStruct);
+
+  /* ---- 状态指示灯 PC13：推挽输出，默认熄灭（低电平点亮，所以拉高=灭）---- */
+  GPIO_InitStruct.Pin   = STATUS_LED_Pin;
+  GPIO_InitStruct.Mode  = GPIO_MODE_OUTPUT_PP;
+  GPIO_InitStruct.Pull  = GPIO_NOPULL;
+  GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+  HAL_GPIO_Init(STATUS_LED_GPIO_Port, &GPIO_InitStruct);
+  STATUS_LED_OFF();
   /* USER CODE END ESP_EN */
 
 }

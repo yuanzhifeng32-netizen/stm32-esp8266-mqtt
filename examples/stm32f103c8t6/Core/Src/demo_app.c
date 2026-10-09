@@ -13,6 +13,7 @@
 
 #include "esp_net.h"
 #include "esp_net_config.h"
+#include "main.h"               /* WIFI_CFG_Pin / HAL_GPIO_ReadPin（PB6 配网按键） */
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -42,6 +43,12 @@ void demo_app_task(void *argument)
 {
     uint32_t seconds = 0U;
     uint32_t seq     = 0U;
+    uint32_t tick100 = 0U;   /* 100 ms 节拍计数，累计 10 次 = 1 秒 */
+#if ESP_PROV_ENABLE
+    uint32_t holdMs   = 0U;   /* PB6 连续按住的时长（ms） */
+    uint8_t  trigLock = 0U;   /* 触发一次后置 1，松开才清零，避免一直按着每 3 s 反复触发 */
+    uint8_t  ledOn    = 0U;   /* PC13 配网闪烁的当前相位 */
+#endif
 
     (void)argument;
 
@@ -55,21 +62,73 @@ void demo_app_task(void *argument)
     ESP_LOG("  stm32103 | STM32F103C8T6 | ESP8266 + MQTT (demo)\r\n");
     ESP_LOG("  USART2 : PA2/PA3 115200 <--DMA ch6--> ESP8266\r\n");
     ESP_LOG("  USART1 : PA9/PA10 115200   debug log\r\n");
-    ESP_LOG("  broker : %s:%u   cmd topic: %s\r\n",
+#if (ESP_MQTT_TRANSPORT == ESP_MQTT_TRANSPORT_WEBSOCKET)
+    ESP_LOG("  broker : ws://%s:%u%s   cmd topic: %s\r\n",
+            ESP_MQTT_HOST, (unsigned)ESP_WS_PORT, ESP_WS_PATH, ESP_NET_TOPIC_CMD);
+#else
+    ESP_LOG("  broker : tcp://%s:%u   cmd topic: %s\r\n",
             ESP_MQTT_HOST, (unsigned)ESP_MQTT_PORT, ESP_NET_TOPIC_CMD);
+#endif
     ESP_LOG("  pub    : %s   period: %ld s\r\n",
             DEMO_TOPIC_PUB, (long)s_reportPeriodS);
+#if ESP_PROV_ENABLE
+    ESP_LOG("  wifi   : hold PB6 %u ms or no creds -> provisioning (AP \"%s\", PC13 blinks)\r\n",
+            (unsigned)ESP_PROV_HOLD_MS, ESP_PROV_AP_SSID);
+#endif
     ESP_LOG("  build  : %s %s   heap_free: %u B\r\n",
             __DATE__, __TIME__, (unsigned)xPortGetFreeHeapSize());
     ESP_LOG("============================================\r\n");
 
-    /* ---- 业务主循环：每秒跑一次，联网后按周期上报 ---- */
+    /* ---- 业务主循环：100 ms 一拍（顺带轮询配网按键），满 1 秒做一次上报节拍 ---- */
     for (;;)
     {
         char payload[64];
         int  len;
 
-        osDelay(1000U);
+        osDelay(100U);
+
+        /* ---- 配网按键：PB6 连续按住满 ESP_PROV_HOLD_MS 就请求配网 ---- */
+#if ESP_PROV_ENABLE
+        if (HAL_GPIO_ReadPin(WIFI_CFG_GPIO_Port, WIFI_CFG_Pin) == GPIO_PIN_RESET)
+        {
+            if (trigLock == 0U)
+            {
+                holdMs += 100U;
+                if (holdMs >= ESP_PROV_HOLD_MS)
+                {
+                    holdMs   = 0U;
+                    trigLock = 1U;   /* 锁住，必须松手后才能再次触发 */
+                    ESP_LOG("[demo] PB6 hold -> request wifi config\r\n");
+                    esp_net_request_config();
+                }
+            }
+        }
+        else
+        {
+            holdMs   = 0U;
+            trigLock = 0U;
+        }
+
+        /* ---- 状态灯 PC13：配网模式期间闪烁提示，其余时间熄灭 ---- */
+        if (esp_net_is_configuring() != 0U)
+        {
+            ledOn ^= 1U;
+            if (ledOn != 0U) { STATUS_LED_ON(); } else { STATUS_LED_OFF(); }
+        }
+        else if (ledOn != 0U)
+        {
+            ledOn = 0U;
+            STATUS_LED_OFF();
+        }
+#endif
+
+        /* ---- 满 1 秒才走一次上报节拍 ---- */
+        tick100++;
+        if (tick100 < 10U)
+        {
+            continue;
+        }
+        tick100 = 0U;
         seconds++;
 
         if ((esp_net_is_online() == 0U) || (s_reportPeriodS <= 0))

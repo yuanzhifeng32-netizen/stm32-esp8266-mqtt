@@ -108,6 +108,30 @@ uint8_t esp_at_link_closed(void);
 void esp_at_clear_link_closed(void);
 
 /**
+ * @brief  开关"原始接收"：开时收到的字节不再按分帧规则拆 "+IPD,<len>:"，
+ *         全部原样进 AT 文本环，交给调用者自己解析。
+ * @note   配网模式用 TCP 服务器（CIPMUX=1），请求帧是 "+IPD,<id>,<len>:"，
+ *         比普通分帧多一个 link id 字段，驱动的分流器不认。所以配网前
+ *         esp_at_set_raw_rx(1)，配网结束 esp_at_set_raw_rx(0) 恢复。
+ *         透传链路模式下本来就是裸字节流，本开关无影响。
+ */
+void esp_at_set_raw_rx(uint8_t on);
+
+/**
+ * @brief  给"原始接收"注册一个旁路回调（可传 NULL 注销）。
+ * @note   配网时上网数据（"+IPD,<id>,<len>:…"）和 AT 应答共用一条接收环。
+ *         发 AT 指令要先清环、并一路读到 "OK"/"SEND OK"，这条路径会把期间
+ *         到达的字节当噪声**丢掉**——正在拼的 HTTP 请求就是这么被吃掉的。
+ *         注册本回调后，凡是被 AT 应答路径吃掉的字节都会先喂给它，
+ *         由 esp_prov 自己的状态机接管，请求不再丢失。
+ *         仅在 esp_at_set_raw_rx(1) 期间生效；回调在**任务上下文**执行。
+ */
+void esp_at_set_raw_sink(void (*fn)(uint8_t byte));
+
+/** @brief 当前毫秒时基（转发移植层的 tick_ms），供库内做超时判断 */
+uint32_t esp_at_now_ms(void);
+
+/**
  * @brief  用使能脚硬复位 ESP8266（拉低 ESP_AT_RESET_LOW_MS 再拉高）。
  * @note   port->reset_pin 为 NULL 时本函数什么都不做。
  */

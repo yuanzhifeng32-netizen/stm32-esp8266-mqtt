@@ -36,6 +36,14 @@ static uint16_t s_responseLen;
 /* 是否处于透传模式 */
 static uint8_t  s_transparent;
 
+/* 配网模式（TCP 服务器, CIPMUX=1）时为 1：收到的字节不做 "+IPD,<len>:" 分流，
+   全部原样进 AT 文本环，由 esp_prov 自己解析 "+IPD,<id>,<len>:"。 */
+static uint8_t  s_rawRx;
+
+/* raw 模式下的旁路回调：AT 应答路径（flush / expect）吃掉的字节不丢弃，
+   先喂给它，避免把期间到达的 HTTP 请求静默丢掉。见 esp_at_set_raw_sink()。 */
+static void    (*s_rawSink)(uint8_t byte);
+
 /* 透传模式下对端关掉 TCP 时，模块会回 AT 模式并吐 "CLOSED"。
    这个标志由字节流匹配器置位，供上层做断链判断。
    匹配器是逐字节状态机，所以 "CLOSED" 被拆到两次 read 里也能认出来。 */
@@ -64,6 +72,16 @@ static void at_rx_push(uint8_t byte)
  */
 static void at_flush_rx(void)
 {
+    /* raw 模式（配网）下不能静默丢字节：清环之前先把还躺在环里的字节
+       交给旁路回调，正在拼的 HTTP 请求可能就在其中。 */
+    if ((s_rawRx != 0U) && (s_rawSink != NULL))
+    {
+        while (s_rxHead != s_rxTail)
+        {
+            s_rawSink(s_rxRing[s_rxHead]);
+            s_rxHead = (uint16_t)((s_rxHead + 1U) % ESP_NET_RX_BUFFER_SIZE);
+        }
+    }
     s_rxHead = s_rxTail;
 }
 
@@ -269,6 +287,8 @@ void esp_at_init(const esp_port_t *port)
     s_transparent = 0U;
     s_closedFlag  = 0U;
     s_closedMatch = 0U;
+    s_rawRx       = 0U;
+    s_rawSink     = NULL;
 #if (ESP_LINK_MODE != ESP_LINK_MODE_TRANSPARENT)
     s_dataHead = 0U;
     s_dataTail = 0U;
@@ -299,15 +319,24 @@ void esp_at_input(const uint8_t *data, uint16_t len)
 #if (ESP_LINK_MODE == ESP_LINK_MODE_TRANSPARENT)
         at_rx_push(data[i]);
 #else
-        /* 分帧模式：在这里把 AT 应答文本与 "+IPD" 载荷分流到两条缓冲 */
-        at_ipd_feed(data[i]);
+        /* 分帧模式：把 AT 应答文本与 "+IPD" 载荷分流到两条缓冲。
+           配网(raw)模式下不分流，字节全部当文本，由 esp_prov 自己解析
+           "+IPD,<id>,<len>:"（服务器模式比普通分帧多一个 link id 字段）。 */
+        if (s_rawRx != 0U)
+        {
+            at_rx_push(data[i]);
+        }
+        else
+        {
+            at_ipd_feed(data[i]);
+        }
 #endif
     }
 }
 
 void esp_at_flush(void)
 {
-    s_rxHead = s_rxTail;
+    at_flush_rx();   /* raw 模式下会先把残留字节喂给旁路回调，再清环 */
 #if (ESP_LINK_MODE != ESP_LINK_MODE_TRANSPARENT)
     /* 数据缓冲与拆包状态也要一起清：不然后面新链路的第一个字节
        会被上一轮的半截帧头带偏 */
@@ -416,6 +445,17 @@ esp_err_t esp_at_expect(const char *expect, uint32_t timeout_ms)
         if (n > 0U)
         {
             uint16_t i;
+
+            /* raw 模式（配网）：这段字节本是"AT 应答"，但里面可能夹着
+               "+IPD,<id>,<len>:…" 的上网数据。先原样交给旁路回调，
+               免得 HTTP 请求被当噪声丢掉。 */
+            if ((s_rawRx != 0U) && (s_rawSink != NULL))
+            {
+                for (i = 0U; i < n; i++)
+                {
+                    s_rawSink(chunk[i]);
+                }
+            }
 
             /* 累积成 C 字符串，方便 strstr 判断 */
             for (i = 0U; i < n; i++)
@@ -573,6 +613,21 @@ void esp_at_clear_link_closed(void)
 {
     s_closedFlag  = 0U;
     s_closedMatch = 0U;
+}
+
+void esp_at_set_raw_rx(uint8_t on)
+{
+    s_rawRx = (on != 0U) ? 1U : 0U;
+}
+
+void esp_at_set_raw_sink(void (*fn)(uint8_t byte))
+{
+    s_rawSink = fn;
+}
+
+uint32_t esp_at_now_ms(void)
+{
+    return (s_port != NULL) ? s_port->tick_ms() : 0U;
 }
 
 void esp_at_hw_reset(void)

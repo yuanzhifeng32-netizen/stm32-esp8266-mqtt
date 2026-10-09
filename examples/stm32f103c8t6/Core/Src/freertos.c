@@ -29,6 +29,7 @@
 #include "usart.h"              /* huart1 / huart2 / hdma_usart1_rx / hdma_usart2_rx */
 #include "demo_config.h"        /* demo 自己的开关（框架参数见 library/esp_net_config.h） */
 #include "esp_net.h"            /* 框架 API：esp_net_init / esp_net_task ... */
+#include "esp_net_config.h"     /* 框架参数（ESP_PROV_ENABLE / ESP_LOG ...） */
 #include "esp_port_stm32f1.h"   /* 移植层实例 esp_port_stm32f1 */
 #include "demo_app.h"           /* demo_app_task() */
 /* USER CODE END Includes */
@@ -178,6 +179,19 @@ void MX_FREERTOS_Init(void) {
 #else
   /* 正常联网模式：绑定移植层 + 启动串口接收（DMA 循环 + 空闲中断喂数据） */
   esp_net_init(&esp_port_stm32f1);
+#if ESP_PROV_ENABLE
+  /* 上电触发配网：若此刻 PB6 已按住（低电平），开机就直接进配网，不再尝试旧 WiFi。
+     放在 esp_net_init() **之后**：init 里会把配网标志清零，这里再置位才有效。 */
+  if (HAL_GPIO_ReadPin(WIFI_CFG_GPIO_Port, WIFI_CFG_Pin) == GPIO_PIN_RESET)
+  {
+    HAL_Delay(30U);   /* 简单消抖：30 ms 后仍为低才算真按下 */
+    if (HAL_GPIO_ReadPin(WIFI_CFG_GPIO_Port, WIFI_CFG_Pin) == GPIO_PIN_RESET)
+    {
+      ESP_LOG("[net] PB6 held at boot -> provisioning\r\n");
+      esp_net_request_config();
+    }
+  }
+#endif
 #endif
   /* USER CODE END Init */
 
